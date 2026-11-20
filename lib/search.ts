@@ -1,13 +1,14 @@
 // 검색 한 번으로 묶기 (PLAN 9~10번)
 //
-// 흐름: 사실관계 → AI가 쟁점·검색어·법령 후보·시점을 뽑음
-//       → 법제처 API에서 법령 조문 확인 + 사례 후보 조회 (동시에)
-//       → AI가 사례 후보를 줄 세움 → 결과를 돌려줌
+// 화면에서 고른 토글에 해당하는 쪽만 검색한다.
+//   법령 범위:        사실관계 → (AI 분석) → 법제처 API에서 법령 조문 확인
+//   선결정례 등 범위: 사실관계 → (AI 분석) → 법제처 API에서 사례 후보 조회 → AI가 줄 세움
+// AI 분석 결과(검색 계획)는 첫 검색 때 한 번만 만들고, 화면이 다른 토글을 검색할 때 다시 보내 준다.
 // 사례 요약은 여기서 만들지 않는다. 화면이 5건씩 따로 요청한다. (lib/summarize.ts)
 
-import { analyzeFacts, rankCases, type Analysis } from "./ai";
-import { getArticle, searchDecisions, searchPrecedents, LawApiError, type LawVersionCache } from "./law-api";
-import type { CaseItem, LawArticle, SearchResponse } from "./types";
+import { analyzeFacts, rankCases } from "./ai";
+import { getArticle, searchDecisions, searchPrecedents, LawApiError, type LawCache } from "./law-api";
+import type { CaseItem, LawArticle, LawCandidate, LawResult, SearchPlan, SearchResponse, SearchScope } from "./types";
 
 const MAX_LAWS = 10; // 법령은 최대 10개
 const MAX_CASES = 20; // 선결정례 등은 최대 20건
@@ -16,12 +17,12 @@ const MAX_CANDIDATES = 110; // AI에게 보여 줄 사례 후보 수 한도
 const formatDate = (yyyymmdd: string) => `${yyyymmdd.slice(0, 4)}.${yyyymmdd.slice(4, 6)}.${yyyymmdd.slice(6, 8)}.`;
 
 /** AI가 제안한 법령 후보를 법제처 API로 확인해, 실제로 조회된 조문만 남긴다. */
-async function verifyLaws(analysis: Analysis): Promise<LawArticle[]> {
-  if (analysis.lawCandidates.length === 0) return [];
+async function verifyLaws(plan: SearchPlan): Promise<LawArticle[]> {
+  if (plan.lawCandidates.length === 0) return [];
 
-  const cache: LawVersionCache = new Map();
+  const cache: LawCache = new Map();
   const settled = await Promise.allSettled(
-    analysis.lawCandidates.map((c) => getArticle(c.lawName, c.articleNo, c.branchNo, analysis.baseDate, cache)),
+    plan.lawCandidates.map((c) => getArticle(c.lawName, c.articleNo, c.branchNo, c.title, plan.baseDate, cache)),
   );
   // 모든 조회가 실패했다면 법제처 API에 문제가 있는 것이므로 오류로 알린다.
   if (settled.every((s) => s.status === "rejected")) throw new LawApiError("법령을 조회하지 못했습니다.");
@@ -34,21 +35,20 @@ async function verifyLaws(analysis: Analysis): Promise<LawArticle[]> {
     const key = `${article.lawName}|${article.articleLabel}`;
     if (seen.has(key)) return;
     seen.add(key);
-    laws.push({ ...article, reason: analysis.lawCandidates[index].reason });
+    laws.push({ ...article, reason: plan.lawCandidates[index].reason });
   });
   return laws.slice(0, MAX_LAWS);
 }
 
 /** 여러 검색어로 사례 후보를 모은 뒤, AI가 관련성 순으로 줄 세운다. */
-async function findCases(facts: string, analysis: Analysis): Promise<CaseItem[]> {
-  if (analysis.keywords.length === 0) return [];
-  const latestFirst = analysis.latestFirst;
+async function findCases(facts: string, plan: SearchPlan): Promise<CaseItem[]> {
+  if (plan.keywords.length === 0) return [];
 
   // 검색어마다 결정례와 판결을 동시에 조회한다. 앞쪽 검색어 3개는 본문 검색도 함께 한다.
   // 후보는 항상 최근 날짜 순으로 받아, 최근 사례가 후보에서 빠지지 않게 한다.
   // 판결은 본문이 없는 출처를 뺀 뒤에도 후보가 남도록 넉넉히 받는다.
   const searches: Promise<CaseItem[]>[] = [];
-  analysis.keywords.forEach((keyword, index) => {
+  plan.keywords.forEach((keyword, index) => {
     searches.push(searchDecisions(keyword, { latestFirst: true, count: 30 }));
     searches.push(searchPrecedents(keyword, { latestFirst: true, count: 60 }));
     if (index < 3) {
@@ -77,52 +77,93 @@ async function findCases(facts: string, analysis: Analysis): Promise<CaseItem[]>
   }
   if (candidates.length === 0) return [];
 
-  const order = await rankCases(facts, analysis.issue, candidates, latestFirst);
+  const order = await rankCases(facts, plan.issue, candidates, plan.latestFirst);
   const ranked = order.map((index) => candidates[index]).slice(0, MAX_CASES);
 
   // "가장 최근" 조건이 있으면, 관련 있다고 고른 사례들을 최근 날짜 순으로 보여 준다.
-  if (latestFirst) ranked.sort((a, b) => b.date.localeCompare(a.date));
+  if (plan.latestFirst) ranked.sort((a, b) => b.date.localeCompare(a.date));
   return ranked;
 }
 
 /** 적용 시점 표시와 안내 문구를 만든다. */
-function describeBasis(analysis: Analysis, laws: LawArticle[]): { basisLabel: string; notice: string | null } {
+function describeBasis(plan: SearchPlan, laws: LawArticle[]): Pick<LawResult, "basisLabel" | "notice"> {
   const historicalCount = laws.filter((l) => l.historical).length;
 
-  if (analysis.dateStatus === "clear" && analysis.baseDate && historicalCount > 0) {
+  if (plan.dateStatus === "clear" && plan.baseDate && historicalCount > 0) {
     const notice =
       historicalCount < laws.length
         ? "일부 조문은 입력하신 시점의 내용을 조회하지 못해 현행 조문으로 표시했습니다. 조문마다 표시된 시행일을 확인해 주세요."
         : null;
-    return { basisLabel: `${formatDate(analysis.baseDate)} 기준`, notice };
+    return { basisLabel: `${formatDate(plan.baseDate)} 기준`, notice };
   }
-  if (analysis.dateStatus === "clear") {
+  if (plan.dateStatus === "clear") {
     return { basisLabel: "현행 법령 기준", notice: laws.length > 0 ? "입력하신 시점의 조문을 조회하지 못해 현행 조문으로 표시했습니다." : null };
   }
   return {
     basisLabel: "현행 법령 기준",
     notice:
-      analysis.dateStatus === "unclear"
+      plan.dateStatus === "unclear"
         ? "시점이 명확하지 않아 현행 법령 기준으로 표시했습니다. 거래·과세 시점(연도)을 하나로 적어 주시면 그 시점의 조문을 찾습니다."
         : "사실관계에 시점이 없어 현행 법령 기준으로 표시했습니다. 거래·과세 시점(연도)을 적어 주시면 그 시점의 조문을 찾습니다.",
   };
 }
 
-/** 검색 한 번을 처음부터 끝까지 실행한다. */
-export async function runSearch(facts: string): Promise<SearchResponse> {
-  const analysis = await analyzeFacts(facts);
+const asText = (value: unknown, max: number): string => (typeof value === "string" ? value.trim().slice(0, max) : "");
 
-  // PRD: 조세 분야만 다룬다.
-  if (!analysis.isTax) {
-    return {
-      issue: "",
-      basisLabel: "",
-      notice: "법률창고는 조세 분야만 다룹니다. 세무 관련 사실관계를 적어 주세요.",
-      laws: [],
-      cases: [],
-    };
+/**
+ * 화면이 다시 보내 준 검색 계획을 점검한다. 모양이 맞지 않으면 null을 돌려주고, 그러면 AI 분석을 새로 한다.
+ * 계획에 든 값은 검색어와 조문 후보일 뿐이고, 화면에 나가는 사건번호·조문은 여전히 법제처 API에서 조회한 것만 쓴다.
+ */
+export function sanitizePlan(raw: unknown): SearchPlan | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const plan = raw as Record<string, unknown>;
+
+  const keywords = (Array.isArray(plan.keywords) ? plan.keywords : [])
+    .map((k) => asText(k, 30))
+    .filter((k) => k.length >= 2)
+    .slice(0, 10);
+
+  const lawCandidates: LawCandidate[] = [];
+  for (const item of Array.isArray(plan.lawCandidates) ? plan.lawCandidates.slice(0, 12) : []) {
+    if (!item || typeof item !== "object") continue;
+    const c = item as Record<string, unknown>;
+    const lawName = asText(c.lawName, 80);
+    const articleNo = Number(c.articleNo);
+    const branchNo = Number(c.branchNo ?? 0) || 0;
+    if (!lawName || !Number.isInteger(articleNo) || articleNo < 1 || !Number.isInteger(branchNo) || branchNo < 0) continue;
+    lawCandidates.push({ lawName, articleNo, branchNo, title: asText(c.title, 60), reason: asText(c.reason, 300) });
   }
 
-  const [laws, cases] = await Promise.all([verifyLaws(analysis), findCases(facts, analysis)]);
-  return { issue: analysis.issue, ...describeBasis(analysis, laws), laws, cases };
+  const baseDate = asText(plan.baseDate, 8);
+  const dateIsValid = /^(19|20)\d{2}(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])$/.test(baseDate);
+  const dateStatus = plan.dateStatus === "clear" && dateIsValid ? "clear" : plan.dateStatus === "unclear" ? "unclear" : "none";
+
+  const issue = asText(plan.issue, 600);
+  if (!issue && keywords.length === 0 && lawCandidates.length === 0) return null;
+
+  return {
+    isTax: plan.isTax !== false,
+    issue,
+    keywords,
+    lawCandidates,
+    baseDate: dateStatus === "clear" ? baseDate : null,
+    dateStatus,
+    latestFirst: plan.latestFirst === true,
+  };
+}
+
+/** 고른 범위(법령 또는 선결정례 등)만 검색한다. 검색 계획이 없으면 AI 분석부터 한다. */
+export async function runSearch(facts: string, scope: SearchScope, givenPlan: SearchPlan | null): Promise<SearchResponse> {
+  const plan = givenPlan ?? (await analyzeFacts(facts));
+
+  // PRD: 조세 분야만 다룬다.
+  if (!plan.isTax) {
+    return { issue: "", outOfScope: "법률창고는 조세 분야만 다룹니다. 세무 관련 사실관계를 적어 주세요.", plan };
+  }
+
+  if (scope === "law") {
+    const laws = await verifyLaws(plan);
+    return { issue: plan.issue, outOfScope: null, plan, lawResult: { ...describeBasis(plan, laws), laws } };
+  }
+  return { issue: plan.issue, outOfScope: null, plan, cases: await findCases(facts, plan) };
 }

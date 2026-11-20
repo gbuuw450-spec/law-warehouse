@@ -39,18 +39,31 @@ const 날짜 = (d) => (d?.length === 8 ? `${d.slice(0, 4)}.${d.slice(4, 6)}.${d.
 
 async function 한사례(번호, 사실관계) {
   console.log(`\n━━━ 테스트 사례 ${번호} ━━━\n입력: ${사실관계}`);
+  // 화면과 같은 순서로 요청한다: 먼저 법령만 검색하고, 그 검색 계획을 그대로 써서 선결정례 등을 검색한다.
   const 시작 = Date.now();
-  const 검색 = await 요청("/api/search", { facts: 사실관계 });
-  const 검색시간 = Date.now() - 시작;
+  const 법령검색 = await 요청("/api/search", { facts: 사실관계, scope: "law" });
+  const 법령시간 = Date.now() - 시작;
 
-  const 처음다섯 = 검색.cases.slice(0, 5);
+  const 사례시작 = Date.now();
+  const 사례검색 = await 요청("/api/search", { facts: 사실관계, scope: "case", plan: 법령검색.plan });
+  const 처음다섯 = (사례검색.cases ?? []).slice(0, 5);
   let 요약들 = [];
   if (처음다섯.length > 0) {
     요약들 = (await 요청("/api/summarize", { items: 처음다섯.map(({ kind, id }) => ({ kind, id })) })).summaries;
   }
-  const 전체시간 = Date.now() - 시작;
+  const 사례시간 = Date.now() - 사례시작;
+  const 전체시간 = 법령시간 + 사례시간;
+  const 판정 = (ms) => (ms <= 30_000 ? "30초 이내" : ms <= 60_000 ? "30초 초과, 60초 이내" : "60초 초과");
 
-  console.log(`걸린 시간: 검색 ${초(검색시간)} + 요약 ${초(전체시간 - 검색시간)} = ${초(전체시간)} ${전체시간 <= 30_000 ? "(30초 이내)" : 전체시간 <= 60_000 ? "(30초 초과, 60초 이내)" : "(60초 초과)"}`);
+  const 검색 = {
+    issue: 법령검색.issue,
+    basisLabel: 법령검색.lawResult?.basisLabel ?? "",
+    notice: 법령검색.outOfScope ?? 법령검색.lawResult?.notice ?? null,
+    laws: 법령검색.lawResult?.laws ?? [],
+    cases: 사례검색.cases ?? [],
+  };
+
+  console.log(`걸린 시간: 법령 토글 ${초(법령시간)} (${판정(법령시간)}) / 선결정례 등 토글 ${초(사례시간)} (${판정(사례시간)})`);
   console.log(`쟁점: ${검색.issue}`);
   console.log(`기준: ${검색.basisLabel}${검색.notice ? ` / 안내: ${검색.notice}` : ""}`);
 

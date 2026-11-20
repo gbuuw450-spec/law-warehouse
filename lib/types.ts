@@ -48,16 +48,60 @@ export interface CaseSummary {
   hasBody: boolean;
 }
 
-/** 검색 창구가 돌려주는 내용 */
+/** 검색 범위: 법령만, 또는 선결정례 등만. 화면에서 고른 토글에 해당하는 쪽만 검색한다. */
+export type SearchScope = "law" | "case";
+
+/** AI가 제안한 법령 조문 후보 (법제처 API로 확인하기 전) */
+export interface LawCandidate {
+  lawName: string;
+  articleNo: number;
+  branchNo: number;
+  /** AI가 기억하는 조문 제목. 번호가 바뀌었을 때 제목으로 다시 찾는 데 쓴다. */
+  title: string;
+  reason: string;
+}
+
+/**
+ * 검색 계획: AI가 사실관계를 분석한 결과.
+ * 첫 검색 때 만들어 화면이 기억해 두었다가, 다른 토글을 검색할 때 다시 보내 AI 분석을 한 번만 하게 한다.
+ */
+export interface SearchPlan {
+  /** 조세 분야 질문인지 */
+  isTax: boolean;
+  /** 쟁점 정리 (2문장 이내) */
+  issue: string;
+  /** 사례 검색어 */
+  keywords: string[];
+  lawCandidates: LawCandidate[];
+  /** 기준일 YYYYMMDD. 시점이 하나로 명확할 때만 */
+  baseDate: string | null;
+  /** 시점 상태: none(없음), clear(명확), unclear(불명확하거나 여러 개) */
+  dateStatus: "none" | "clear" | "unclear";
+  /** "가장 최근" 같은 조건이 있는지 */
+  latestFirst: boolean;
+}
+
+/** 법령 검색 결과 */
+export interface LawResult {
+  /** 적용 시점 표시 (예: "현행 법령 기준", "2026.01.31. 기준") */
+  basisLabel: string;
+  /** 시점에 대한 안내 문구 (없으면 null) */
+  notice: string | null;
+  laws: LawArticle[];
+}
+
+/** 검색 창구가 돌려주는 내용. 요청한 범위의 결과만 들어 있다. */
 export interface SearchResponse {
   /** 쟁점 정리 (2문장 이내) */
   issue: string;
-  /** 적용 시점 표시 (예: "현행 법령 기준", "2026.01.31. 기준") */
-  basisLabel: string;
-  /** 시점이나 입력에 대한 안내 문구 (없으면 null) */
-  notice: string | null;
-  laws: LawArticle[];
-  cases: CaseItem[];
+  /** 조세 분야가 아닐 때의 안내 문구 (조세 분야면 null) */
+  outOfScope: string | null;
+  /** 다른 토글을 검색할 때 다시 보낼 검색 계획 */
+  plan: SearchPlan;
+  /** 법령 범위를 검색했을 때만 들어 있다. */
+  lawResult?: LawResult;
+  /** 선결정례 등 범위를 검색했을 때만 들어 있다. */
+  cases?: CaseItem[];
 }
 
 /** 본문 조회 창구가 돌려주는 내용 */

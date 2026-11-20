@@ -3,11 +3,22 @@
 // 법률창고 화면 (PLAN 11~17번)
 // - 로그인 화면: 비밀번호 한 개로 들어간다.
 // - 검색 화면: 위쪽 토글(법령 / 선결정례 등), 검색창, 쟁점 정리, 결과 목록.
+//   검색은 고른 토글의 범위만 한다. 다른 토글로 옮기면 그때 그 범위를 검색한다.
 // 검색 결과는 이 화면(브라우저) 안에만 두며, 새로 고치면 사라진다. 서버에는 저장하지 않는다.
 
 import { useEffect, useRef, useState } from "react";
 import { findPersonalInfo } from "@/lib/privacy";
-import type { CaseItem, CaseSummary, DetailResponse, ErrorResponse, LawArticle, SearchResponse } from "@/lib/types";
+import type {
+  CaseItem,
+  CaseSummary,
+  DetailResponse,
+  ErrorResponse,
+  LawArticle,
+  LawResult,
+  SearchPlan,
+  SearchResponse,
+  SearchScope,
+} from "@/lib/types";
 
 const PAGE_SIZE = 5; // 한 번에 5개씩 보여 준다.
 const MAX_LAWS = 10; // 법령은 최대 10개
@@ -151,15 +162,28 @@ function LoginForm({ onSuccess }: { onSuccess: () => void }) {
 // 검색 화면
 // ─────────────────────────────────────────────────────────────
 
-type Tab = "law" | "case";
+type Tab = SearchScope; // "law"(법령) 또는 "case"(선결정례 등)
 type DetailState = { status: "loading" } | { status: "error" } | { status: "done"; data: DetailResponse };
+type LoadStatus = "idle" | "loading" | "done" | "error";
+
+const EMPTY_LAW_RESULT: LawResult = { basisLabel: "", notice: null, laws: [] };
 
 function SearchScreen({ onLoggedOut }: { onLoggedOut: () => void }) {
   const [tab, setTab] = useState<Tab>("law");
   const [facts, setFacts] = useState("");
-  const [status, setStatus] = useState<"idle" | "loading" | "done" | "error">("idle");
   const [warning, setWarning] = useState("");
-  const [result, setResult] = useState<SearchResponse | null>(null);
+
+  // 검색은 토글별로 따로 한다. 법령 토글에서 검색하면 법령만 찾고,
+  // 선결정례 등 토글로 옮기면 그때 사례를 찾는다. (반대 순서도 같다)
+  const [lawStatus, setLawStatus] = useState<LoadStatus>("idle");
+  const [caseStatus, setCaseStatus] = useState<LoadStatus>("idle");
+  const [lawResult, setLawResult] = useState<LawResult>(EMPTY_LAW_RESULT);
+  const [cases, setCases] = useState<CaseItem[]>([]);
+
+  // 첫 검색 때 AI가 만든 쟁점과 검색 계획. 다른 토글을 검색할 때 다시 보내 AI 분석을 한 번만 하게 한다.
+  const [issue, setIssue] = useState("");
+  const [outOfScope, setOutOfScope] = useState<string | null>(null);
+  const [plan, setPlan] = useState<SearchPlan | null>(null);
 
   const [lawVisible, setLawVisible] = useState(PAGE_SIZE);
   const [caseVisible, setCaseVisible] = useState(PAGE_SIZE);
@@ -170,7 +194,8 @@ function SearchScreen({ onLoggedOut }: { onLoggedOut: () => void }) {
   const [details, setDetails] = useState<Record<string, DetailState>>({});
 
   const lastFacts = useRef("");
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // 새 검색을 시작하면 번호가 올라간다. 이전 검색의 답이 늦게 도착해도 화면에 섞이지 않게 한다.
+  const searchId = useRef(0);
 
   /** 로그인이 풀렸으면 로그인 화면으로 돌려보낸다. */
   function handleAuthError(error: unknown): boolean {
@@ -181,48 +206,52 @@ function SearchScreen({ onLoggedOut }: { onLoggedOut: () => void }) {
     return false;
   }
 
-  /** 검색: 쟁점·법령·사례 목록을 받고, 이어서 처음 5건의 요약을 받는다. */
-  async function search(text: string) {
-    const trimmed = text.trim();
-    if (!trimmed || status === "loading") return;
-
-    // 주민등록번호·사업자등록번호 형태가 있으면 서버로 보내지 않고 멈춘다.
-    const privacyWarning = findPersonalInfo(trimmed);
-    if (privacyWarning) {
-      setWarning(privacyWarning);
-      return;
-    }
-
-    lastFacts.current = trimmed;
-    setWarning("");
+  /** 한쪽 범위(법령 또는 선결정례 등)만 검색한다. 사례는 이어서 처음 5건의 요약까지 받는다. */
+  async function runScope(scope: Tab, text: string, knownPlan: SearchPlan | null) {
+    const id = searchId.current;
+    const setStatus = scope === "law" ? setLawStatus : setCaseStatus;
     setStatus("loading");
-    setResult(null);
-    setSummaries({});
-    setLawVisible(PAGE_SIZE);
-    setCaseVisible(PAGE_SIZE);
-    setMoreStatus("idle");
-    setOpenItems({});
-    setDetails({});
 
     const startedAt = Date.now();
     try {
-      const found = await post<SearchResponse>("/api/search", { facts: trimmed }, SEARCH_LIMIT_MS);
-      const firstCases = found.cases.slice(0, PAGE_SIZE);
+      const found = await post<SearchResponse>("/api/search", { facts: text, scope, plan: knownPlan }, SEARCH_LIMIT_MS);
+      if (id !== searchId.current) return; // 그 사이 새 검색이 시작됐으면 버린다.
+
       let firstSummaries: Record<string, CaseSummary> = {};
+      const firstCases = scope === "case" ? (found.cases ?? []).slice(0, PAGE_SIZE) : [];
       if (firstCases.length > 0) {
         // 남은 시간 안에 요약까지 끝나야 한다. (검색 전체가 60초 이내)
         const remaining = Math.max(1_000, SEARCH_LIMIT_MS - (Date.now() - startedAt));
         const { summaries: list } = await post<{ summaries: CaseSummary[] }>(
           "/api/summarize",
-          { items: firstCases.map(({ kind, id }) => ({ kind, id })) },
+          { items: firstCases.map(({ kind, id: caseId }) => ({ kind, id: caseId })) },
           remaining,
         );
+        if (id !== searchId.current) return;
         firstSummaries = Object.fromEntries(list.map((s) => [caseKey(s), s]));
       }
-      setResult(found);
-      setSummaries(firstSummaries);
+
+      setPlan(found.plan);
+      setIssue(found.issue);
+      setOutOfScope(found.outOfScope);
+
+      if (found.outOfScope) {
+        // 조세 분야가 아니면 양쪽 모두 빈 결과로 끝낸다.
+        setLawResult(EMPTY_LAW_RESULT);
+        setCases([]);
+        setLawStatus("done");
+        setCaseStatus("done");
+        return;
+      }
+      if (scope === "law") {
+        setLawResult(found.lawResult ?? EMPTY_LAW_RESULT);
+      } else {
+        setCases((found.cases ?? []).slice(0, MAX_CASES));
+        setSummaries(firstSummaries);
+      }
       setStatus("done");
     } catch (error) {
+      if (id !== searchId.current) return;
       if (handleAuthError(error)) return;
       if (error instanceof ApiError && error.code === "privacy") {
         setWarning(error.message);
@@ -233,6 +262,45 @@ function SearchScreen({ onLoggedOut }: { onLoggedOut: () => void }) {
     }
   }
 
+  /** 검색 버튼: 지금 고른 토글의 범위만 새로 검색한다. */
+  function search(text: string) {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+
+    // 주민등록번호·사업자등록번호 형태가 있으면 서버로 보내지 않고 멈춘다.
+    const privacyWarning = findPersonalInfo(trimmed);
+    if (privacyWarning) {
+      setWarning(privacyWarning);
+      return;
+    }
+
+    searchId.current += 1;
+    lastFacts.current = trimmed;
+    setWarning("");
+    setLawStatus("idle");
+    setCaseStatus("idle");
+    setLawResult(EMPTY_LAW_RESULT);
+    setCases([]);
+    setIssue("");
+    setOutOfScope(null);
+    setPlan(null);
+    setSummaries({});
+    setLawVisible(PAGE_SIZE);
+    setCaseVisible(PAGE_SIZE);
+    setMoreStatus("idle");
+    setOpenItems({});
+    setDetails({});
+
+    void runScope(tab, trimmed, null);
+  }
+
+  /** 토글 전환: 이미 검색한 사실관계가 있고 그 토글을 아직 찾지 않았으면, 그때 그 범위를 검색한다. */
+  function selectTab(next: Tab) {
+    setTab(next);
+    const status = next === "law" ? lawStatus : caseStatus;
+    if (lastFacts.current && status === "idle" && !outOfScope) void runScope(next, lastFacts.current, plan);
+  }
+
   /** 더보기 (법령): 이미 받아 둔 목록에서 다음 5개를 보여 준다. */
   function showMoreLaws() {
     setLawVisible((count) => Math.min(count + PAGE_SIZE, MAX_LAWS));
@@ -240,21 +308,24 @@ function SearchScreen({ onLoggedOut }: { onLoggedOut: () => void }) {
 
   /** 더보기 (사례): 다음 5건의 요약을 새로 받아서 보여 준다. */
   async function showMoreCases() {
-    if (!result || moreStatus === "loading") return;
-    const next = result.cases.slice(caseVisible, caseVisible + PAGE_SIZE);
+    if (moreStatus === "loading") return;
+    const next = cases.slice(caseVisible, caseVisible + PAGE_SIZE);
     if (next.length === 0) return;
 
+    const id = searchId.current;
     setMoreStatus("loading");
     try {
       const { summaries: list } = await post<{ summaries: CaseSummary[] }>(
         "/api/summarize",
-        { items: next.map(({ kind, id }) => ({ kind, id })) },
+        { items: next.map(({ kind, id: caseId }) => ({ kind, id: caseId })) },
         MORE_LIMIT_MS,
       );
+      if (id !== searchId.current) return;
       setSummaries((previous) => ({ ...previous, ...Object.fromEntries(list.map((s) => [caseKey(s), s])) }));
       setCaseVisible((count) => Math.min(count + PAGE_SIZE, MAX_CASES));
       setMoreStatus("idle");
     } catch (error) {
+      if (id !== searchId.current) return;
       if (handleAuthError(error)) return;
       setMoreStatus("error");
     }
@@ -277,24 +348,24 @@ function SearchScreen({ onLoggedOut }: { onLoggedOut: () => void }) {
     }
   }
 
-  const laws = result?.laws.slice(0, MAX_LAWS) ?? [];
-  const cases = result?.cases.slice(0, MAX_CASES) ?? [];
+  const laws = lawResult.laws.slice(0, MAX_LAWS);
   const shownLaws = laws.slice(0, lawVisible);
   const shownCases = cases.slice(0, caseVisible);
+  const currentStatus = tab === "law" ? lawStatus : caseStatus;
 
   return (
     <div className="flex flex-col gap-4">
       {/* 위쪽 토글 */}
       <div role="tablist" aria-label="결과 종류" className="grid grid-cols-2 overflow-hidden rounded-lg border border-[#1b3a6b]">
-        <TabButton selected={tab === "law"} onClick={() => setTab("law")} label="법령" count={status === "done" ? laws.length : null} />
-        <TabButton selected={tab === "case"} onClick={() => setTab("case")} label="선결정례 등" count={status === "done" ? cases.length : null} />
+        <TabButton selected={tab === "law"} onClick={() => selectTab("law")} label="법령" count={lawStatus === "done" ? laws.length : null} />
+        <TabButton selected={tab === "case"} onClick={() => selectTab("case")} label="선결정례 등" count={caseStatus === "done" ? cases.length : null} />
       </div>
 
       {/* 검색창 */}
       <form
         onSubmit={(event) => {
           event.preventDefault();
-          void search(facts);
+          search(facts);
         }}
         className="rounded-lg border border-slate-200 bg-white p-3 shadow-sm"
       >
@@ -303,7 +374,6 @@ function SearchScreen({ onLoggedOut }: { onLoggedOut: () => void }) {
         </label>
         <textarea
           id="facts"
-          ref={textareaRef}
           value={facts}
           onChange={(event) => {
             setFacts(event.target.value);
@@ -321,10 +391,10 @@ function SearchScreen({ onLoggedOut }: { onLoggedOut: () => void }) {
           <p className="text-xs text-slate-500">의뢰인을 알아볼 수 있는 정보는 적지 마세요.</p>
           <button
             type="submit"
-            disabled={!facts.trim() || status === "loading"}
+            disabled={!facts.trim() || currentStatus === "loading"}
             className="rounded bg-[#1b3a6b] px-5 py-2 font-semibold text-white disabled:opacity-50"
           >
-            {status === "loading" ? "찾는 중…" : "검색"}
+            {currentStatus === "loading" ? "찾는 중…" : tab === "law" ? "법령 검색" : "선결정례 검색"}
           </button>
         </div>
         {warning && (
@@ -334,20 +404,37 @@ function SearchScreen({ onLoggedOut }: { onLoggedOut: () => void }) {
         )}
       </form>
 
+      {/* 쟁점 정리: 어느 쪽이든 한 번 검색하면 나온다. */}
+      {(issue || outOfScope) && (
+        <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
+          {issue && (
+            <p className="leading-relaxed">
+              <span className="mr-2 rounded bg-[#1b3a6b] px-2 py-0.5 text-xs font-semibold text-white">쟁점</span>
+              {issue}
+            </p>
+          )}
+          {outOfScope && <p className="text-sm text-slate-700">{outOfScope}</p>}
+          {tab === "law" && lawStatus === "done" && lawResult.basisLabel && (
+            <p className="mt-2 text-sm font-semibold text-[#1b3a6b]">{lawResult.basisLabel}</p>
+          )}
+          {tab === "law" && lawStatus === "done" && lawResult.notice && <p className="mt-1 text-sm text-slate-600">{lawResult.notice}</p>}
+        </section>
+      )}
+
       {/* 검색 중 */}
-      {status === "loading" && (
+      {currentStatus === "loading" && (
         <p role="status" className="rounded-lg border border-slate-200 bg-white px-4 py-8 text-center text-sm text-slate-600">
-          찾는 중입니다… 보통 30초 안팎, 길면 1분까지 걸립니다.
+          {tab === "law" ? "법령을 찾는 중입니다…" : "선결정례와 판결을 찾는 중입니다…"} 길면 1분까지 걸립니다.
         </p>
       )}
 
       {/* 조회 실패 또는 60초 초과 */}
-      {status === "error" && (
+      {currentStatus === "error" && (
         <div role="alert" className="rounded-lg border border-red-200 bg-red-50 px-4 py-6 text-center">
           <p className="text-sm text-red-800">자료를 불러오지 못했습니다.</p>
           <button
             type="button"
-            onClick={() => void search(lastFacts.current)}
+            onClick={() => void runScope(tab, lastFacts.current, plan)}
             className="mt-3 rounded border border-red-300 bg-white px-4 py-2 text-sm font-semibold text-red-800"
           >
             다시 시도
@@ -355,73 +442,57 @@ function SearchScreen({ onLoggedOut }: { onLoggedOut: () => void }) {
         </div>
       )}
 
-      {/* 결과 */}
-      {status === "done" && result && (
-        <>
-          {(result.issue || result.notice) && (
-            <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
-              {result.issue && (
-                <p className="leading-relaxed">
-                  <span className="mr-2 rounded bg-[#1b3a6b] px-2 py-0.5 text-xs font-semibold text-white">쟁점</span>
-                  {result.issue}
+      {/* 법령 결과 */}
+      {tab === "law" && lawStatus === "done" && !outOfScope && (
+        <section aria-label="법령" className="flex flex-col gap-3">
+          {laws.length === 0 && <EmptyMessage text="관련 법령을 찾지 못했습니다." />}
+          {shownLaws.map((law) => {
+            const key = `law:${law.lawName}:${law.articleLabel}`;
+            return (
+              <LawCard
+                key={key}
+                law={law}
+                open={!!openItems[key]}
+                onToggle={() => setOpenItems((previous) => ({ ...previous, [key]: !previous[key] }))}
+              />
+            );
+          })}
+          {lawVisible < laws.length && <MoreButton onClick={showMoreLaws} />}
+        </section>
+      )}
+
+      {/* 선결정례 등 결과 */}
+      {tab === "case" && caseStatus === "done" && !outOfScope && (
+        <section aria-label="선결정례 등" className="flex flex-col gap-3">
+          {cases.length === 0 && <EmptyMessage text="관련 사례를 찾지 못했습니다." />}
+          {shownCases.map((item) => {
+            const key = caseKey(item);
+            return (
+              <CaseCard
+                key={key}
+                item={item}
+                summary={summaries[key]}
+                open={!!openItems[key]}
+                detail={details[key]}
+                onToggle={() => void toggleCase(item)}
+              />
+            );
+          })}
+          {caseVisible < cases.length && (
+            <>
+              {moreStatus === "error" && (
+                <p role="alert" className="text-center text-sm text-red-700">
+                  자료를 불러오지 못했습니다. 아래 버튼으로 다시 시도해 주세요.
                 </p>
               )}
-              {result.basisLabel && <p className="mt-2 text-sm font-semibold text-[#1b3a6b]">{result.basisLabel}</p>}
-              {result.notice && <p className="mt-1 text-sm text-slate-600">{result.notice}</p>}
-            </section>
+              <MoreButton
+                onClick={() => void showMoreCases()}
+                busy={moreStatus === "loading"}
+                label={moreStatus === "error" ? "다시 시도" : "더보기"}
+              />
+            </>
           )}
-
-          {tab === "law" && (
-            <section aria-label="법령" className="flex flex-col gap-3">
-              {laws.length === 0 && <EmptyMessage text="관련 법령을 찾지 못했습니다." />}
-              {shownLaws.map((law) => {
-                const key = `law:${law.lawName}:${law.articleLabel}`;
-                return (
-                  <LawCard
-                    key={key}
-                    law={law}
-                    open={!!openItems[key]}
-                    onToggle={() => setOpenItems((previous) => ({ ...previous, [key]: !previous[key] }))}
-                  />
-                );
-              })}
-              {lawVisible < laws.length && <MoreButton onClick={showMoreLaws} />}
-            </section>
-          )}
-
-          {tab === "case" && (
-            <section aria-label="선결정례 등" className="flex flex-col gap-3">
-              {cases.length === 0 && <EmptyMessage text="관련 사례를 찾지 못했습니다." />}
-              {shownCases.map((item) => {
-                const key = caseKey(item);
-                return (
-                  <CaseCard
-                    key={key}
-                    item={item}
-                    summary={summaries[key]}
-                    open={!!openItems[key]}
-                    detail={details[key]}
-                    onToggle={() => void toggleCase(item)}
-                  />
-                );
-              })}
-              {caseVisible < cases.length && (
-                <>
-                  {moreStatus === "error" && (
-                    <p role="alert" className="text-center text-sm text-red-700">
-                      자료를 불러오지 못했습니다. 아래 버튼으로 다시 시도해 주세요.
-                    </p>
-                  )}
-                  <MoreButton
-                    onClick={() => void showMoreCases()}
-                    busy={moreStatus === "loading"}
-                    label={moreStatus === "error" ? "다시 시도" : "더보기"}
-                  />
-                </>
-              )}
-            </section>
-          )}
-        </>
+        </section>
       )}
     </div>
   );

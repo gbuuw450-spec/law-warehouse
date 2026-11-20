@@ -255,8 +255,69 @@ async function findLawAtDate(lawName: string, baseDate: string): Promise<LawVers
   return picked ? { mst: picked.mst, effectiveDate: picked.effectiveDate, historical: true } : null;
 }
 
-/** 한 번의 검색 안에서 법령 찾기 결과를 기억해 두는 곳 */
-export type LawVersionCache = Map<string, Promise<LawVersion | null>>;
+/** 법제처 API에서 받은 법령 한 건 (조문 전체 포함) */
+interface LoadedLaw {
+  officialName: string;
+  version: LawVersion;
+  /** 장·절 제목을 뺀 실제 조문들 */
+  units: Json[];
+}
+
+/** 한 번의 검색 안에서 받아 온 법령을 기억해 두는 곳 (같은 법령을 두 번 받지 않기 위함) */
+export type LawCache = Map<string, Promise<LoadedLaw | null>>;
+
+/** 법령 한 건의 조문 전체를 받아 온다. 법령을 찾지 못하면 null. */
+async function loadLaw(lawName: string, baseDate: string | null): Promise<LoadedLaw | null> {
+  const version = await resolveLawVersion(lawName, baseDate);
+  if (!version || !version.mst) return null;
+
+  const response = await callLawApi(
+    "lawService.do",
+    version.historical ? { target: "eflaw", MST: version.mst, efYd: version.effectiveDate } : { target: "law", MST: version.mst },
+  );
+  const law = extractDetail(response);
+  if (!law) return null;
+
+  const basic = (law["기본정보"] ?? {}) as Json;
+  const units = toArray(((law["조문"] ?? {}) as Json)["조문단위"] as Json | Json[] | undefined)
+    // 장·절 제목("전문")은 빼고 실제 조문만 남긴다.
+    .filter((u) => u && typeof u === "object" && text(u["조문여부"]) === "조문");
+  return { officialName: text(basic["법령명_한글"]) || lawName, version, units };
+}
+
+/** 조문 묶음에서 조 번호와 가지번호를 읽는다. 가지번호(제47조의5의 "5")는 따로 오거나 조문키("0047051")의 5~6번째 자리에 있다. */
+function articleNumbers(unit: Json): { articleNo: number; branchNo: number } {
+  return {
+    articleNo: Number(text(unit["조문번호"])),
+    branchNo: Number(text(unit["조문가지번호"]) || text(unit["조문키"]).slice(4, 6) || "0"),
+  };
+}
+
+/** 제목 비교용: 띄어쓰기와 기호를 없앤다. */
+const normalizeTitle = (value: string) => value.replace(/[\s·ㆍ・,.()\[\]「」『』'"]/g, "");
+
+/** 두 제목이 얼마나 비슷한지 0~1로 돌려준다. (한쪽이 다른 쪽을 포함하면 1, 아니면 두 글자씩 겹치는 정도) */
+function titleSimilarity(a: string, b: string): number {
+  const x = normalizeTitle(a);
+  const y = normalizeTitle(b);
+  if (!x || !y) return 0;
+  if (x === y) return 1;
+  if (x.length >= 3 && y.length >= 3 && (x.includes(y) || y.includes(x))) return 0.9;
+  const pairs = (s: string) => Array.from({ length: Math.max(0, s.length - 1) }, (_, i) => s.slice(i, i + 2));
+  const xp = pairs(x);
+  const yp = pairs(y);
+  if (xp.length === 0 || yp.length === 0) return 0;
+  const remaining = [...yp];
+  let hits = 0;
+  for (const p of xp) {
+    const at = remaining.indexOf(p);
+    if (at >= 0) {
+      hits += 1;
+      remaining.splice(at, 1);
+    }
+  }
+  return (2 * hits) / (xp.length + yp.length);
+}
 
 /** 기준일이 있으면 그 시점의 법령을, 없거나 못 찾으면 현행 법령을 찾는다. */
 async function resolveLawVersion(lawName: string, baseDate: string | null): Promise<LawVersion | null> {
@@ -296,64 +357,71 @@ function collectArticleText(unit: Json): string {
   return lines.join("\n");
 }
 
+const NUMBER_MATCH_MIN = 0.5; // 번호로 찾은 조문의 제목이 이 정도는 비슷해야 맞는 조문으로 본다.
+const TITLE_MATCH_MIN = 0.7; // 번호가 틀렸을 때 제목으로 다시 찾으려면 이 정도는 비슷해야 한다.
+
 /**
- * 법령 이름과 조문 번호로 조문 한 건을 가져온다.
+ * 법령 이름, 조문 번호, 조문 제목으로 조문 한 건을 가져온다.
  * - baseDate(YYYYMMDD)가 있으면 그 시점에 시행 중이던 조문을 먼저 찾고, 없으면 현행 조문으로 대신한다.
- * - 법령이나 조문이 법제처 API에서 확인되지 않으면 null을 돌려준다. (지어낸 조문을 걸러내는 장치)
+ * - AI가 기억하는 조문 번호는 법 개정으로 바뀌었을 수 있다. 그래서 번호로 찾은 조문의 제목이 기대한 제목과 다르면,
+ *   같은 법령에서 제목이 맞는 조문을 다시 찾는다. (예: 번호는 제81조라고 했지만 실제로는 제80조의2)
+ * - 번호도 제목도 확인되지 않으면 null을 돌려준다. (지어내거나 잘못 기억한 조문을 걸러내는 장치)
  */
 export async function getArticle(
   lawName: string,
   articleNo: number,
   branchNo: number,
+  expectedTitle: string,
   baseDate: string | null,
-  versionCache: LawVersionCache = new Map(),
+  cache: LawCache = new Map(),
 ): Promise<ArticleResult | null> {
   if (!Number.isInteger(articleNo) || articleNo < 1 || articleNo > 9999) return null;
   if (!Number.isInteger(branchNo) || branchNo < 0 || branchNo > 99) return null;
 
-  // 같은 법령의 조문을 여러 개 찾을 때 법령 찾기를 한 번만 하도록 기억해 둔다.
+  // 같은 법령의 조문을 여러 개 찾을 때 법령을 한 번만 받아 오도록 기억해 둔다.
   const cacheKey = `${squash(lawName)}|${baseDate ?? ""}`;
-  let pending = versionCache.get(cacheKey);
+  let pending = cache.get(cacheKey);
   if (!pending) {
-    pending = resolveLawVersion(lawName, baseDate);
-    versionCache.set(cacheKey, pending);
+    pending = loadLaw(lawName, baseDate);
+    cache.set(cacheKey, pending);
   }
-  const version = await pending;
-  if (!version || !version.mst) return null;
-
-  const jo = String(articleNo).padStart(4, "0") + String(branchNo).padStart(2, "0");
-  const response = await callLawApi(
-    "lawService.do",
-    version.historical
-      ? { target: "eflaw", MST: version.mst, efYd: version.effectiveDate, JO: jo }
-      : { target: "law", MST: version.mst, JO: jo },
-  );
-  const law = extractDetail(response);
+  const law = await pending;
   if (!law) return null;
 
-  const basic = (law["기본정보"] ?? {}) as Json;
-  const officialName = text(basic["법령명_한글"]) || lawName;
-  const units = toArray(((law["조문"] ?? {}) as Json)["조문단위"] as Json | Json[] | undefined);
-  // 장·절 제목("전문")은 빼고 실제 조문만 고른다.
-  const unit = units.find(
-    (u) =>
-      text(u["조문여부"]) === "조문" &&
-      Number(text(u["조문번호"])) === articleNo &&
-      // 가지번호(제47조의5의 "5")는 따로 오거나, 조문키("0047051")의 5~6번째 자리에 들어 있다.
-      Number(text(u["조문가지번호"]) || text(u["조문키"]).slice(4, 6) || "0") === branchNo,
-  );
+  const byNumber = law.units.find((u) => {
+    const n = articleNumbers(u);
+    return n.articleNo === articleNo && n.branchNo === branchNo;
+  });
+
+  let unit: Json | undefined;
+  if (!expectedTitle) {
+    unit = byNumber; // 기대한 제목이 없으면 번호로만 확인한다.
+  } else if (byNumber && titleSimilarity(text(byNumber["조문제목"]), expectedTitle) >= NUMBER_MATCH_MIN) {
+    unit = byNumber;
+  } else {
+    // 번호가 틀렸을 수 있으므로 제목이 가장 비슷한 조문을 찾는다. 비슷한 정도가 같으면 번호가 가까운 쪽을 고른다.
+    let best: { unit: Json; score: number; distance: number } | null = null;
+    for (const candidate of law.units) {
+      const score = titleSimilarity(text(candidate["조문제목"]), expectedTitle);
+      if (score < TITLE_MATCH_MIN) continue;
+      const distance = Math.abs(articleNumbers(candidate).articleNo - articleNo);
+      if (!best || score > best.score || (score === best.score && distance < best.distance)) best = { unit: candidate, score, distance };
+    }
+    unit = best?.unit;
+  }
   if (!unit) return null;
 
   const body = collectArticleText(unit);
   if (!body) return null;
 
+  const actual = articleNumbers(unit);
   const title = text(unit["조문제목"]);
-  const label = `제${articleNo}조${branchNo ? `의${branchNo}` : ""}${title ? `(${title})` : ""}`;
+  const label = `제${actual.articleNo}조${actual.branchNo ? `의${actual.branchNo}` : ""}${title ? `(${title})` : ""}`;
   return {
-    lawName: officialName,
+    lawName: law.officialName,
     articleLabel: label,
     text: body,
-    effectiveDate: normalizeDate(unit["조문시행일자"]) || version.effectiveDate,
-    historical: version.historical,
+    effectiveDate: normalizeDate(unit["조문시행일자"]) || law.version.effectiveDate,
+    historical: law.version.historical,
   };
 }

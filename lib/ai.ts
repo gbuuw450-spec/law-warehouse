@@ -73,6 +73,8 @@ export interface LawCandidate {
   lawName: string;
   articleNo: number;
   branchNo: number;
+  /** AI가 기억하는 조문 제목. 번호가 바뀌었을 때 제목으로 다시 찾는 데 쓴다. */
+  title: string;
   reason: string;
 }
 
@@ -100,7 +102,7 @@ const ANALYZE_SYSTEM = `당신은 한국 조세 분야 자료 검색을 돕는 �
   "isTax": 조세(국세·지방세·관세, 조세불복 포함) 분야이면 true, 아니면 false,
   "issue": "이 사례의 쟁점은 ~이다." 형식으로 2문장 이내,
   "keywords": 조세심판원 결정례와 법원 판결의 "사건명"에 실제로 들어 있을 법한 검색어 8~10개,
-  "lawCandidates": 관련 가능성이 높은 순서로 최대 12개 [{"lawName": 법령의 정식 명칭, "articleNo": 조 번호(정수), "branchNo": 가지번호(없으면 0), "reason": 이 조문이 사례와 관련된 이유 1문장}],
+  "lawCandidates": 관련 가능성이 높은 순서로 최대 12개 [{"lawName": 법령의 정식 명칭, "articleNo": 조 번호(정수), "branchNo": 가지번호(없으면 0), "title": 조문 제목(괄호 안에 적힌 제목 그대로, 예: "불복"), "reason": 이 조문이 사례와 관련된 이유 1문장}],
   "dateStatus": "none" | "clear" | "unclear",
   "baseDate": "YYYYMMDD" 또는 null,
   "latestFirst": true 또는 false
@@ -108,7 +110,7 @@ const ANALYZE_SYSTEM = `당신은 한국 조세 분야 자료 검색을 돕는 �
 
 규칙:
 - keywords: 각 검색어는 1~2개 단어로 짧게 쓴다. 띄어 쓴 단어는 모두 포함된 사건명만 검색되므로, 긴 문장은 쓰지 않는다. 같은 뜻의 다른 표현(예: "가공거래", "가공매입", "가공세금계산서")을 섞어 넣는다. 가장 중요한 검색어를 앞에 둔다.
-- lawCandidates: 법률, 시행령, 시행규칙을 가리지 않고 실제 존재한다고 확신하는 조문만 넣는다. 확신이 없으면 넣지 않는다. 이 목록은 법제처에서 조회해 확인한 뒤에만 사용된다. "제47조의2"는 articleNo 47, branchNo 2로 쓴다.
+- lawCandidates: 법률, 시행령, 시행규칙을 가리지 않고 실제 존재한다고 확신하는 조문만 넣는다. 확신이 없으면 넣지 않는다. 이 목록은 법제처에서 조회해 확인한 뒤에만 사용된다. "제47조의2"는 articleNo 47, branchNo 2로 쓴다. 법 개정으로 조문 번호가 바뀌었을 수 있으므로 title은 반드시 채운다. 번호와 제목이 다르면 제목으로 다시 찾는다. 쟁점에 직접 적용되는 조문뿐 아니라, 그 조문을 준용하거나 절차(청구기간, 각하·기각·인용 결정, 준용 규정)를 정한 조문도 관련이 있으면 넣는다.
 - dateStatus와 baseDate: 거래·처분·과세 시점이 글에 하나로 명확히 적혀 있을 때만 "clear"로 하고 baseDate를 채운다. 월까지만 있으면 그 달 말일, 연도만 있으면 그 해 12월 31일로 한다. 시점이 전혀 없으면 "none", "작년"처럼 모호하거나 서로 다른 연도가 여러 개면 "unclear"로 하고 baseDate는 null로 한다. 추정하지 않는다.
 - latestFirst: "가장 최근", "최신" 처럼 최근 사례를 원한다는 조건이 있을 때만 true.
 - 사건번호, 판결 내용, 결론은 절대 쓰지 않는다.`;
@@ -130,7 +132,7 @@ export async function analyzeFacts(facts: string): Promise<Analysis> {
     const articleNo = Number(item.articleNo);
     const branchNo = Number(item.branchNo ?? 0) || 0;
     if (!lawName || !Number.isInteger(articleNo) || articleNo < 1) continue;
-    lawCandidates.push({ lawName, articleNo, branchNo, reason: limitSentences(asString(item.reason), 1) });
+    lawCandidates.push({ lawName, articleNo, branchNo, title: asString(item.title).slice(0, 60), reason: limitSentences(asString(item.reason), 1) });
     if (lawCandidates.length >= 12) break;
   }
 
