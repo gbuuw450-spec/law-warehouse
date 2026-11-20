@@ -1,0 +1,9 @@
+@import "tailwindcss";
+
+/* 사이트 전체에 적용되는 기본 모양: 흰 바탕에 한글이 잘 보이는 글꼴 */
+body {
+  background: #f8fafc;
+  color: #0f172a;
+  font-family: "Pretendard", "Malgun Gothic", "맑은 고딕", "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
+  word-break: keep-all;
+}
