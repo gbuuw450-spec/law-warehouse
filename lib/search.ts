@@ -7,6 +7,7 @@
 // 사례 요약은 여기서 만들지 않는다. 화면이 5건씩 따로 요청한다. (lib/summarize.ts)
 
 import { analyzeFacts, rankCases } from "./ai";
+import { findCaseNumbers, isOnlyCaseNumbers, normalizeCaseNumber } from "./case-number";
 import { keepLatestOfSameDecisions } from "./dedupe";
 import { describeWantedResult, matchesWantedResult, outcomeFromDecisionOrder, outcomeFromVerdictType } from "./result-filter";
 import { getArticle, getCaseBody, searchDecisions, searchPrecedents, LawApiError, type LawCache } from "./law-api";
@@ -19,7 +20,10 @@ const MAX_COLLECTED = 170; // 같은 결정을 묶기 전에 모아 둘 후보 �
 const RESULT_CHECK_AT_ONCE = 12; // 결과(주문)를 확인할 때 동시에 조회하는 건수
 const RESULT_CHECK_LIMIT_MS = 15_000; // 결과 확인에 쓰는 시간 한도
 
-const formatDate = (yyyymmdd: string) => `${yyyymmdd.slice(0, 4)}.${yyyymmdd.slice(4, 6)}.${yyyymmdd.slice(6, 8)}.`;
+// 사건번호만 적었을 때 돌려주는 빈 검색 계획. (AI 분석을 하지 않았다는 뜻)
+const NUMBER_ONLY_PLAN: SearchPlan = { isTax: true, issue: "", keywords: [], lawCandidates: [], baseDate: null, dateStatus: "none", latestFirst: false };
+
+const formatDate =(yyyymmdd: string) => `${yyyymmdd.slice(0, 4)}.${yyyymmdd.slice(4, 6)}.${yyyymmdd.slice(6, 8)}.`;
 
 /** AI가 제안한 법령 후보를 법제처 API로 확인해, 실제로 조회된 조문만 남긴다. */
 async function verifyLaws(plan: SearchPlan): Promise<LawArticle[]> {
@@ -76,6 +80,30 @@ async function keepWantedResult(items: CaseItem[], wanted: WantedResult): Promis
   // 하나도 조회하지 못했다면 법제처 API에 문제가 있는 것이므로 오류로 알린다.
   if (items.length > 0 && failed === items.length) throw new LawApiError("사례의 결과를 조회하지 못했습니다.");
   return items.filter((_, index) => keep[index]);
+}
+
+/**
+ * 사건번호로 사례를 바로 찾는다. AI를 쓰지 않는다.
+ * 법제처가 돌려준 것 중 사건번호가 실제로 맞는 것만 남긴다. (비슷한 번호가 섞여 나오는 것을 막는다)
+ */
+async function findByCaseNumbers(numbers: string[], kind: CaseKind): Promise<CaseItem[]> {
+  const settled = await Promise.allSettled(
+    numbers.map((number) => (kind === "decision" ? searchDecisions(number, { count: 20 }) : searchPrecedents(number, { count: 20, byCaseNumber: true }))),
+  );
+  if (settled.every((s) => s.status === "rejected")) throw new LawApiError("사례를 조회하지 못했습니다.");
+
+  const found: CaseItem[] = [];
+  const seen = new Set<string>();
+  settled.forEach((result, index) => {
+    if (result.status !== "fulfilled") return;
+    for (const item of result.value) {
+      const key = `${item.kind}:${item.id}`;
+      if (seen.has(key) || !normalizeCaseNumber(item.caseNumber).includes(numbers[index])) continue;
+      seen.add(key);
+      found.push(item);
+    }
+  });
+  return found;
 }
 
 /** 여러 검색어로 사례 후보를 모은 뒤, AI가 관련성 순으로 줄 세운다. */
@@ -200,6 +228,17 @@ export function sanitizePlan(raw: unknown): SearchPlan | null {
  * wantedResult는 선결정례 토글에서 고른 결과 조건(인용, 기각)이며, 선결정례 범위에만 쓴다.
  */
 export async function runSearch(facts: string, scope: SearchScope, givenPlan: SearchPlan | null, wantedResult: WantedResult = null): Promise<SearchResponse> {
+  // 사건번호만 적었으면 AI 분석 없이 그 번호로 바로 찾는다. (요금이 들지 않고, 번호가 맞는 사례만 나온다)
+  const numbers = findCaseNumbers(facts);
+  if (isOnlyCaseNumbers(facts)) {
+    if (scope === "law") {
+      const notice = "사건번호로 검색하셨습니다. 사건번호 검색은 선결정례와 법원 판결 토글에서만 찾습니다.";
+      return { issue: "", outOfScope: null, plan: NUMBER_ONLY_PLAN, lawResult: { basisLabel: "", notice, laws: [] } };
+    }
+    const cases = await findByCaseNumbers(numbers, scope);
+    return { issue: "", outOfScope: null, plan: NUMBER_ONLY_PLAN, cases, caseNotice: `사건번호 ${numbers.join(", ")}로 찾았습니다.` };
+  }
+
   const plan = givenPlan ?? (await analyzeFacts(facts));
 
   // PRD: 조세 분야만 다룬다.
@@ -211,14 +250,12 @@ export async function runSearch(facts: string, scope: SearchScope, givenPlan: Se
     const laws = await verifyLaws(plan);
     return { issue: plan.issue, outOfScope: null, plan, lawResult: { ...describeBasis(plan, laws), laws } };
   }
-  if (scope === "precedent") {
-    return { issue: plan.issue, outOfScope: null, plan, cases: await findCases(facts, plan, "precedent", null), caseNotice: null };
-  }
-  return {
-    issue: plan.issue,
-    outOfScope: null,
-    plan,
-    cases: await findCases(facts, plan, "decision", wantedResult),
-    caseNotice: describeWantedResult(wantedResult),
-  };
+  // 사실관계 안에 사건번호가 섞여 있으면, 그 번호의 사례를 찾아 목록 맨 위에 둔다. (찾지 못해도 검색은 계속한다)
+  const [ranked, pinned] = await Promise.all([
+    findCases(facts, plan, scope, scope === "decision" ? wantedResult : null),
+    numbers.length > 0 ? findByCaseNumbers(numbers, scope).catch(() => []) : Promise.resolve([]),
+  ]);
+  const pinnedKeys = new Set(pinned.map((item) => `${item.kind}:${item.id}`));
+  const cases = [...pinned, ...ranked.filter((item) => !pinnedKeys.has(`${item.kind}:${item.id}`))].slice(0, MAX_CASES);
+  return { issue: plan.issue, outOfScope: null, plan, cases, caseNotice: scope === "decision" ? describeWantedResult(wantedResult) : null };
 }

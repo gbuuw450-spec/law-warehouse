@@ -112,11 +112,14 @@ export async function searchDecisions(query: string, options: { bodySearch?: boo
     .filter((item) => item.id && item.caseNumber);
 }
 
-/** 법원 판결을 검색한다. */
-export async function searchPrecedents(query: string, options: { bodySearch?: boolean; latestFirst?: boolean; count?: number } = {}): Promise<CaseItem[]> {
+/** 법원 판결을 검색한다. byCaseNumber가 true면 검색어를 사건번호로 보고 찾는다. */
+export async function searchPrecedents(
+  query: string,
+  options: { bodySearch?: boolean; latestFirst?: boolean; count?: number; byCaseNumber?: boolean } = {},
+): Promise<CaseItem[]> {
   const response = await callLawApi("lawSearch.do", {
     target: "prec",
-    query,
+    ...(options.byCaseNumber ? { nb: query } : { query }),
     display: String(options.count ?? 20),
     ...(options.bodySearch ? { search: "2" } : {}),
     ...(options.latestFirst ? { sort: "ddes" } : {}),
