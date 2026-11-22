@@ -7,12 +7,14 @@
 // 사례 요약은 여기서 만들지 않는다. 화면이 5건씩 따로 요청한다. (lib/summarize.ts)
 
 import { analyzeFacts, rankCases } from "./ai";
+import { keepLatestOfSameDecisions } from "./dedupe";
 import { getArticle, searchDecisions, searchPrecedents, LawApiError, type LawCache } from "./law-api";
 import type { CaseItem, LawArticle, LawCandidate, LawResult, SearchPlan, SearchResponse, SearchScope } from "./types";
 
 const MAX_LAWS = 10; // 법령은 최대 10개
 const MAX_CASES = 20; // 선결정례 등은 최대 20건
 const MAX_CANDIDATES = 110; // AI에게 보여 줄 사례 후보 수 한도
+const MAX_COLLECTED = 170; // 같은 결정을 묶기 전에 모아 둘 후보 수 한도
 
 const formatDate = (yyyymmdd: string) => `${yyyymmdd.slice(0, 4)}.${yyyymmdd.slice(4, 6)}.${yyyymmdd.slice(6, 8)}.`;
 
@@ -61,20 +63,22 @@ async function findCases(facts: string, plan: SearchPlan): Promise<CaseItem[]> {
 
   // 검색별 결과를 한 건씩 번갈아 가며 모아, 어느 한 검색어의 결과만 남지 않게 한다. 겹치는 것은 하나로 합친다.
   const lists = settled.map((s) => (s.status === "fulfilled" ? s.value : []));
-  const candidates: CaseItem[] = [];
+  const collected: CaseItem[] = [];
   const seen = new Set<string>();
   const longest = Math.max(0, ...lists.map((l) => l.length));
-  for (let row = 0; row < longest && candidates.length < MAX_CANDIDATES; row += 1) {
+  for (let row = 0; row < longest && collected.length < MAX_COLLECTED; row += 1) {
     for (const list of lists) {
       const item = list[row];
       if (!item) continue;
       const key = `${item.kind}:${item.id}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      candidates.push(item);
-      if (candidates.length >= MAX_CANDIDATES) break;
+      collected.push(item);
+      if (collected.length >= MAX_COLLECTED) break;
     }
   }
+  // 같은 결정이 여러 건이면 가장 최근 것 한 건만 남긴 뒤, AI에게 보여 줄 만큼만 추린다.
+  const candidates = keepLatestOfSameDecisions(collected).slice(0, MAX_CANDIDATES);
   if (candidates.length === 0) return [];
 
   const order = await rankCases(facts, plan.issue, candidates, plan.latestFirst);
