@@ -44,7 +44,7 @@ export function matchesWantedResult(outcome: Outcome, wanted: WantedResult): boo
 
 /** 화면에 보여 줄 안내 문구. 조건이 없으면 null */
 export function describeWantedResult(wanted: WantedResult): string | null {
-  if (wanted === "accepted") return "인용 사례만 표시했습니다. (일부인용·경정·취소·재조사 포함. 기각·각하 사례와 결과를 확인할 수 없는 판결은 제외)";
-  if (wanted === "rejected") return "기각 사례만 표시했습니다. (각하 포함. 인용·일부인용 사례와 결과를 확인할 수 없는 판결은 제외)";
+  if (wanted === "accepted") return "인용 사례만 표시했습니다. (일부인용·경정·취소·재조사 포함)";
+  if (wanted === "rejected") return "기각 사례만 표시했습니다. (각하 포함)";
   return null;
 }

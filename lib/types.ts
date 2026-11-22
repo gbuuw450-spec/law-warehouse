@@ -48,8 +48,8 @@ export interface CaseSummary {
   hasBody: boolean;
 }
 
-/** 검색 범위: 법령만, 또는 선결정례 등만. 화면에서 고른 토글에 해당하는 쪽만 검색한다. */
-export type SearchScope = "law" | "case";
+/** 검색 범위: 법령, 선결정례(조세심판원 결정례), 법원 판결. 화면에서 고른 토글에 해당하는 쪽만 검색한다. */
+export type SearchScope = "law" | "decision" | "precedent";
 
 /** AI가 제안한 법령 조문 후보 (법제처 API로 확인하기 전) */
 export interface LawCandidate {
@@ -79,11 +79,9 @@ export interface SearchPlan {
   dateStatus: "none" | "clear" | "unclear";
   /** "가장 최근" 같은 조건이 있는지 */
   latestFirst: boolean;
-  /** 원하는 결과 조건: 인용 사례만(accepted), 기각 사례만(rejected), 조건 없음(null) */
-  wantedResult: WantedResult;
 }
 
-/** 사용자가 원하는 사례의 결과. accepted는 납세자 주장이 받아들여진 사례, rejected는 받아들여지지 않은 사례 */
+/** 선결정례 토글에서 사용자가 고른 결과 조건. accepted는 인용, rejected는 기각, null은 선택 안 함(결과와 상관없이 찾기) */
 export type WantedResult = "accepted" | "rejected" | null;
 
 /** 법령 검색 결과 */
@@ -105,7 +103,7 @@ export interface SearchResponse {
   plan: SearchPlan;
   /** 법령 범위를 검색했을 때만 들어 있다. */
   lawResult?: LawResult;
-  /** 선결정례 등 범위를 검색했을 때만 들어 있다. */
+  /** 선결정례 또는 법원 판결 범위를 검색했을 때만 들어 있다. */
   cases?: CaseItem[];
   /** 결과 조건(인용만, 기각만)으로 걸러 냈을 때의 안내 문구. 없으면 null */
   caseNotice?: string | null;

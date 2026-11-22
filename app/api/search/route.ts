@@ -22,12 +22,14 @@ export async function POST(request: Request) {
   if (privacyWarning) return fail("privacy", privacyWarning, 400);
 
   // 화면에서 고른 토글에 해당하는 범위만 검색한다. 범위가 없으면 법령으로 본다.
-  const scope = body?.scope === "case" ? "case" : "law";
+  const scope = body?.scope === "decision" || body?.scope === "precedent" ? body.scope : "law";
+  // 선결정례 토글에서 고른 결과 조건(인용, 기각). 고르지 않았으면 결과와 상관없이 찾는다.
+  const wantedResult = body?.wantedResult === "accepted" || body?.wantedResult === "rejected" ? body.wantedResult : null;
   // 다른 토글에서 이미 만든 검색 계획이 있으면 다시 쓰고, 없으면 AI 분석부터 한다.
   const plan = sanitizePlan(body?.plan);
 
   try {
-    return Response.json(await withTimeout(runSearch(facts, scope, plan), SEARCH_TIMEOUT_MS));
+    return Response.json(await withTimeout(runSearch(facts, scope, plan, wantedResult), SEARCH_TIMEOUT_MS));
   } catch (error) {
     if (error instanceof TimeoutError) return fail("timeout", "자료를 불러오지 못했습니다.", 504);
     // 사실관계나 비밀 값이 로그에 남지 않도록 오류 종류만 기록한다.

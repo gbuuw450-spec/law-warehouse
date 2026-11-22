@@ -1,5 +1,5 @@
-// 요약 창구: 사례 번호를 최대 5개 받아 각 사례의 요약과 결과를 돌려준다. (PLAN 8번, 13번)
-// 처음 검색 직후의 5건과, `더보기`를 누를 때의 다음 5건에 모두 쓰인다.
+// 요약 창구: 사례 번호를 최대 6개 받아 각 사례의 요약과 결과를 돌려준다. (PLAN 8번, 13번)
+// 처음 검색 직후의 6건과, `더보기`를 누를 때의 다음 5건에 모두 쓰인다.
 
 import { fail, readJson, rejectIfLoggedOut, TimeoutError, withTimeout } from "@/lib/http";
 import { buildSummary } from "@/lib/summarize";
@@ -8,7 +8,7 @@ import type { CaseKind, CaseSummary } from "@/lib/types";
 export const maxDuration = 60;
 
 const SUMMARY_TIMEOUT_MS = 45_000;
-const MAX_ITEMS = 5;
+const MAX_ITEMS = 6;
 
 export async function POST(request: Request) {
   const rejected = await rejectIfLoggedOut();

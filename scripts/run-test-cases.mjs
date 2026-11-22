@@ -39,13 +39,13 @@ const 날짜 = (d) => (d?.length === 8 ? `${d.slice(0, 4)}.${d.slice(4, 6)}.${d.
 
 async function 한사례(번호, 사실관계) {
   console.log(`\n━━━ 테스트 사례 ${번호} ━━━\n입력: ${사실관계}`);
-  // 화면과 같은 순서로 요청한다: 먼저 법령만 검색하고, 그 검색 계획을 그대로 써서 선결정례 등을 검색한다.
+  // 화면과 같은 순서로 요청한다: 먼저 법령만 검색하고, 그 검색 계획을 그대로 써서 선결정례(조세심판원)를 검색한다.
   const 시작 = Date.now();
   const 법령검색 = await 요청("/api/search", { facts: 사실관계, scope: "law" });
   const 법령시간 = Date.now() - 시작;
 
   const 사례시작 = Date.now();
-  const 사례검색 = await 요청("/api/search", { facts: 사실관계, scope: "case", plan: 법령검색.plan });
+  const 사례검색 = await 요청("/api/search", { facts: 사실관계, scope: "decision", plan: 법령검색.plan });
   const 처음다섯 = (사례검색.cases ?? []).slice(0, 5);
   let 요약들 = [];
   if (처음다섯.length > 0) {

@@ -10,10 +10,10 @@ import { analyzeFacts, rankCases } from "./ai";
 import { keepLatestOfSameDecisions } from "./dedupe";
 import { describeWantedResult, matchesWantedResult, outcomeFromDecisionOrder, outcomeFromVerdictType } from "./result-filter";
 import { getArticle, getCaseBody, searchDecisions, searchPrecedents, LawApiError, type LawCache } from "./law-api";
-import type { CaseItem, LawArticle, LawCandidate, LawResult, SearchPlan, SearchResponse, SearchScope, WantedResult } from "./types";
+import type { CaseItem, CaseKind, LawArticle, LawCandidate, LawResult, SearchPlan, SearchResponse, SearchScope, WantedResult } from "./types";
 
 const MAX_LAWS = 10; // 법령은 최대 10개
-const MAX_CASES = 20; // 선결정례 등은 최대 20건
+const MAX_CASES = 20; // 선결정례와 법원 판결은 각각 최대 20건
 const MAX_CANDIDATES = 110; // AI에게 보여 줄 사례 후보 수 한도
 const MAX_COLLECTED = 170; // 같은 결정을 묶기 전에 모아 둘 후보 수 한도
 const RESULT_CHECK_AT_ONCE = 12; // 결과(주문)를 확인할 때 동시에 조회하는 건수
@@ -79,19 +79,20 @@ async function keepWantedResult(items: CaseItem[], wanted: WantedResult): Promis
 }
 
 /** 여러 검색어로 사례 후보를 모은 뒤, AI가 관련성 순으로 줄 세운다. */
-async function findCases(facts: string, plan: SearchPlan): Promise<CaseItem[]> {
+async function findCases(facts: string, plan: SearchPlan, kind: CaseKind, wantedResult: WantedResult): Promise<CaseItem[]> {
   if (plan.keywords.length === 0) return [];
 
-  // 검색어마다 결정례와 판결을 동시에 조회한다. 앞쪽 검색어 3개는 본문 검색도 함께 한다.
+  // 고른 토글의 종류(조세심판원 결정례 또는 법원 판결)만 검색어마다 조회한다. 앞쪽 검색어 3개는 본문 검색도 함께 한다.
   // 후보는 항상 최근 날짜 순으로 받아, 최근 사례가 후보에서 빠지지 않게 한다.
   // 판결은 본문이 없는 출처를 뺀 뒤에도 후보가 남도록 넉넉히 받는다.
   const searches: Promise<CaseItem[]>[] = [];
   plan.keywords.forEach((keyword, index) => {
-    searches.push(searchDecisions(keyword, { latestFirst: true, count: 30 }));
-    searches.push(searchPrecedents(keyword, { latestFirst: true, count: 60 }));
-    if (index < 3) {
-      searches.push(searchDecisions(keyword, { bodySearch: true, latestFirst: true, count: 15 }));
-      searches.push(searchPrecedents(keyword, { bodySearch: true, latestFirst: true, count: 40 }));
+    if (kind === "decision") {
+      searches.push(searchDecisions(keyword, { latestFirst: true, count: 40 }));
+      if (index < 3) searches.push(searchDecisions(keyword, { bodySearch: true, latestFirst: true, count: 20 }));
+    } else {
+      searches.push(searchPrecedents(keyword, { latestFirst: true, count: 60 }));
+      if (index < 3) searches.push(searchPrecedents(keyword, { bodySearch: true, latestFirst: true, count: 40 }));
     }
   });
   const settled = await Promise.allSettled(searches);
@@ -114,9 +115,9 @@ async function findCases(facts: string, plan: SearchPlan): Promise<CaseItem[]> {
     }
   }
   // 같은 결정이 여러 건이면 가장 최근 것 한 건만 남긴 뒤, AI에게 보여 줄 만큼만 추린다.
-  // "인용 사례만"처럼 결과 조건이 있으면, 주문을 읽어 조건에 맞는 사례만 먼저 남긴다. (AI에게 보여 주기 전에 거른다)
+  // 화면에서 인용 또는 기각을 골랐으면, 주문을 읽어 그 결과의 사례만 먼저 남긴다. (AI에게 보여 주기 전에 거른다)
   // 같은 결정 묶기보다 먼저 해야, 사건명이 같은 기각 사례 때문에 인용 사례가 빠지는 일이 없다.
-  const wanted = plan.wantedResult ? await keepWantedResult(collected, plan.wantedResult) : collected;
+  const wanted = wantedResult ? await keepWantedResult(collected, wantedResult) : collected;
   const candidates = keepLatestOfSameDecisions(wanted).slice(0, MAX_CANDIDATES);
   if (candidates.length === 0) return [];
 
@@ -191,13 +192,14 @@ export function sanitizePlan(raw: unknown): SearchPlan | null {
     lawCandidates,
     baseDate: dateStatus === "clear" ? baseDate : null,
     dateStatus,
-    latestFirst: plan.latestFirst === true,
-    wantedResult: plan.wantedResult === "accepted" || plan.wantedResult === "rejected" ? plan.wantedResult : null,
-  };
+    latestFirst: plan.latestFirst === true,  };
 }
 
-/** 고른 범위(법령 또는 선결정례 등)만 검색한다. 검색 계획이 없으면 AI 분석부터 한다. */
-export async function runSearch(facts: string, scope: SearchScope, givenPlan: SearchPlan | null): Promise<SearchResponse> {
+/**
+ * 고른 범위(법령, 선결정례, 법원 판결)만 검색한다. 검색 계획이 없으면 AI 분석부터 한다.
+ * wantedResult는 선결정례 토글에서 고른 결과 조건(인용, 기각)이며, 선결정례 범위에만 쓴다.
+ */
+export async function runSearch(facts: string, scope: SearchScope, givenPlan: SearchPlan | null, wantedResult: WantedResult = null): Promise<SearchResponse> {
   const plan = givenPlan ?? (await analyzeFacts(facts));
 
   // PRD: 조세 분야만 다룬다.
@@ -209,5 +211,14 @@ export async function runSearch(facts: string, scope: SearchScope, givenPlan: Se
     const laws = await verifyLaws(plan);
     return { issue: plan.issue, outOfScope: null, plan, lawResult: { ...describeBasis(plan, laws), laws } };
   }
-  return { issue: plan.issue, outOfScope: null, plan, cases: await findCases(facts, plan), caseNotice: describeWantedResult(plan.wantedResult) };
+  if (scope === "precedent") {
+    return { issue: plan.issue, outOfScope: null, plan, cases: await findCases(facts, plan, "precedent", null), caseNotice: null };
+  }
+  return {
+    issue: plan.issue,
+    outOfScope: null,
+    plan,
+    cases: await findCases(facts, plan, "decision", wantedResult),
+    caseNotice: describeWantedResult(wantedResult),
+  };
 }
