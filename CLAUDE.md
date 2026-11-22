@@ -28,7 +28,8 @@
 값은 `.env`에만 있고, 코드에서는 아래 이름으로 읽는다. 서버 쪽 코드에서만 사용하고, 이름에 `NEXT_PUBLIC_`을 붙이지 않는다.
 
 - `OPENAI_API_KEY` — OpenAI API 키
-- `OPENAI_MODEL` — 사용할 OpenAI 모델 이름
+- `OPENAI_MODEL` — 사용할 OpenAI 모델 이름 (쟁점 분석, 줄 세우기)
+- `OPENAI_SUMMARY_MODEL` — 사례 요약에만 쓸 모델 이름 (선택. 없으면 `OPENAI_MODEL`을 쓴다)
 - `LAW_API_KEY` — 법제처 API 인증값
 - `APP_PASSWORD` — 앱 접속 비밀번호
 

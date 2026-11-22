@@ -25,10 +25,23 @@ function getClient(): OpenAI {
   return client;
 }
 
-/** AI에게 질문하고 JSON 답을 받는다. */
-async function askJson(system: string, user: string): Promise<Record<string, unknown>> {
+/** 쟁점 분석과 줄 세우기(찾는 일)에 쓰는 모델 */
+function mainModel(): string {
   const model = process.env.OPENAI_MODEL;
   if (!model) throw new AiError("OPENAI_MODEL이 설정되지 않았습니다.");
+  return model;
+}
+
+/**
+ * 사례 요약에 쓰는 모델. 요약은 요금의 대부분을 차지하지만 "무엇을 찾느냐"에는 영향이 없어서,
+ * OPENAI_SUMMARY_MODEL로 더 저렴한 모델을 따로 지정할 수 있다. 지정하지 않으면 OPENAI_MODEL을 쓴다.
+ */
+function summaryModel(): string {
+  return process.env.OPENAI_SUMMARY_MODEL?.trim() || mainModel();
+}
+
+/** AI에게 질문하고 JSON 답을 받는다. */
+async function askJson(system: string, user: string, model: string = mainModel()): Promise<Record<string, unknown>> {
 
   let content: string | null | undefined;
   try {
@@ -214,7 +227,16 @@ const SUMMARY_SYSTEM = `당신은 한국 조세 사례를 요약하는 보조자
 export async function summarizeCase(kind: "decision" | "precedent", title: string, body: string): Promise<{ summary: string; result: string }> {
   const kindLabel = kind === "decision" ? "조세심판원 결정례" : "법원 판결";
   const trimmed = body.length > SUMMARY_BODY_LIMIT ? `${body.slice(0, SUMMARY_BODY_LIMIT)}\n(이하 생략)` : body;
-  const answer = await askJson(SUMMARY_SYSTEM, `<종류>${kindLabel}</종류>\n<사건명>${title}</사건명>\n<본문>\n${trimmed}\n</본문>`);
+  const prompt = `<종류>${kindLabel}</종류>\n<사건명>${title}</사건명>\n<본문>\n${trimmed}\n</본문>`;
+
+  let answer: Record<string, unknown>;
+  try {
+    answer = await askJson(SUMMARY_SYSTEM, prompt, summaryModel());
+  } catch (error) {
+    // 요약용 모델을 쓸 수 없으면(이름이 틀렸거나 이 키로 쓸 수 없는 모델) 기본 모델로 한 번 더 시도한다.
+    if (summaryModel() === mainModel()) throw error;
+    answer = await askJson(SUMMARY_SYSTEM, prompt, mainModel());
+  }
 
   const summary = limitSentences(asString(answer.summary), 3);
   if (!summary) throw new AiError("AI가 요약을 만들지 못했습니다.");
