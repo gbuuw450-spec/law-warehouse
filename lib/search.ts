@@ -8,13 +8,16 @@
 
 import { analyzeFacts, rankCases } from "./ai";
 import { keepLatestOfSameDecisions } from "./dedupe";
-import { getArticle, searchDecisions, searchPrecedents, LawApiError, type LawCache } from "./law-api";
-import type { CaseItem, LawArticle, LawCandidate, LawResult, SearchPlan, SearchResponse, SearchScope } from "./types";
+import { describeWantedResult, matchesWantedResult, outcomeFromDecisionOrder, outcomeFromVerdictType } from "./result-filter";
+import { getArticle, getCaseBody, searchDecisions, searchPrecedents, LawApiError, type LawCache } from "./law-api";
+import type { CaseItem, LawArticle, LawCandidate, LawResult, SearchPlan, SearchResponse, SearchScope, WantedResult } from "./types";
 
 const MAX_LAWS = 10; // 법령은 최대 10개
 const MAX_CASES = 20; // 선결정례 등은 최대 20건
 const MAX_CANDIDATES = 110; // AI에게 보여 줄 사례 후보 수 한도
 const MAX_COLLECTED = 170; // 같은 결정을 묶기 전에 모아 둘 후보 수 한도
+const RESULT_CHECK_AT_ONCE = 12; // 결과(주문)를 확인할 때 동시에 조회하는 건수
+const RESULT_CHECK_LIMIT_MS = 15_000; // 결과 확인에 쓰는 시간 한도
 
 const formatDate = (yyyymmdd: string) => `${yyyymmdd.slice(0, 4)}.${yyyymmdd.slice(4, 6)}.${yyyymmdd.slice(6, 8)}.`;
 
@@ -40,6 +43,39 @@ async function verifyLaws(plan: SearchPlan): Promise<LawArticle[]> {
     laws.push({ ...article, reason: plan.lawCandidates[index].reason });
   });
   return laws.slice(0, MAX_LAWS);
+}
+
+/**
+ * 결과 조건(인용만, 기각만)에 맞는 사례만 남긴다.
+ * 결과는 법제처 목록에 없어서 사례마다 본문을 열어 주문을 읽는다. AI를 쓰지 않으므로 요금은 들지 않는다.
+ * 한꺼번에 너무 많이 조회하지 않도록 몇 건씩 나눠 조회하고, 정해진 시간 안에 확인하지 못한 사례는 뺀다.
+ */
+async function keepWantedResult(items: CaseItem[], wanted: WantedResult): Promise<CaseItem[]> {
+  const deadline = Date.now() + RESULT_CHECK_LIMIT_MS;
+  const keep = new Array<boolean>(items.length).fill(false);
+  let next = 0;
+  let failed = 0;
+
+  async function worker() {
+    while (next < items.length && Date.now() < deadline) {
+      const index = next;
+      next += 1;
+      const item = items[index];
+      try {
+        const body = await getCaseBody(item.kind, item.id);
+        if (!body) continue;
+        const outcome = item.kind === "decision" ? outcomeFromDecisionOrder(body.order) : outcomeFromVerdictType(body.resultFromApi);
+        keep[index] = matchesWantedResult(outcome, wanted);
+      } catch {
+        failed += 1; // 조회하지 못한 사례는 결과를 알 수 없으므로 뺀다.
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: RESULT_CHECK_AT_ONCE }, worker));
+
+  // 하나도 조회하지 못했다면 법제처 API에 문제가 있는 것이므로 오류로 알린다.
+  if (items.length > 0 && failed === items.length) throw new LawApiError("사례의 결과를 조회하지 못했습니다.");
+  return items.filter((_, index) => keep[index]);
 }
 
 /** 여러 검색어로 사례 후보를 모은 뒤, AI가 관련성 순으로 줄 세운다. */
@@ -78,7 +114,10 @@ async function findCases(facts: string, plan: SearchPlan): Promise<CaseItem[]> {
     }
   }
   // 같은 결정이 여러 건이면 가장 최근 것 한 건만 남긴 뒤, AI에게 보여 줄 만큼만 추린다.
-  const candidates = keepLatestOfSameDecisions(collected).slice(0, MAX_CANDIDATES);
+  // "인용 사례만"처럼 결과 조건이 있으면, 주문을 읽어 조건에 맞는 사례만 먼저 남긴다. (AI에게 보여 주기 전에 거른다)
+  // 같은 결정 묶기보다 먼저 해야, 사건명이 같은 기각 사례 때문에 인용 사례가 빠지는 일이 없다.
+  const wanted = plan.wantedResult ? await keepWantedResult(collected, plan.wantedResult) : collected;
+  const candidates = keepLatestOfSameDecisions(wanted).slice(0, MAX_CANDIDATES);
   if (candidates.length === 0) return [];
 
   const order = await rankCases(facts, plan.issue, candidates, plan.latestFirst);
@@ -153,6 +192,7 @@ export function sanitizePlan(raw: unknown): SearchPlan | null {
     baseDate: dateStatus === "clear" ? baseDate : null,
     dateStatus,
     latestFirst: plan.latestFirst === true,
+    wantedResult: plan.wantedResult === "accepted" || plan.wantedResult === "rejected" ? plan.wantedResult : null,
   };
 }
 
@@ -169,5 +209,5 @@ export async function runSearch(facts: string, scope: SearchScope, givenPlan: Se
     const laws = await verifyLaws(plan);
     return { issue: plan.issue, outOfScope: null, plan, lawResult: { ...describeBasis(plan, laws), laws } };
   }
-  return { issue: plan.issue, outOfScope: null, plan, cases: await findCases(facts, plan) };
+  return { issue: plan.issue, outOfScope: null, plan, cases: await findCases(facts, plan), caseNotice: describeWantedResult(plan.wantedResult) };
 }

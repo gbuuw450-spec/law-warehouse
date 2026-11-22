@@ -179,6 +179,8 @@ function SearchScreen({ onLoggedOut }: { onLoggedOut: () => void }) {
   const [caseStatus, setCaseStatus] = useState<LoadStatus>("idle");
   const [lawResult, setLawResult] = useState<LawResult>(EMPTY_LAW_RESULT);
   const [cases, setCases] = useState<CaseItem[]>([]);
+  // "인용 사례만"처럼 결과 조건으로 걸러 냈을 때의 안내 문구
+  const [caseNotice, setCaseNotice] = useState<string | null>(null);
 
   // 첫 검색 때 AI가 만든 쟁점과 검색 계획. 다른 토글을 검색할 때 다시 보내 AI 분석을 한 번만 하게 한다.
   const [issue, setIssue] = useState("");
@@ -247,6 +249,7 @@ function SearchScreen({ onLoggedOut }: { onLoggedOut: () => void }) {
         setLawResult(found.lawResult ?? EMPTY_LAW_RESULT);
       } else {
         setCases((found.cases ?? []).slice(0, MAX_CASES));
+        setCaseNotice(found.caseNotice ?? null);
         setSummaries(firstSummaries);
       }
       setStatus("done");
@@ -281,6 +284,7 @@ function SearchScreen({ onLoggedOut }: { onLoggedOut: () => void }) {
     setCaseStatus("idle");
     setLawResult(EMPTY_LAW_RESULT);
     setCases([]);
+    setCaseNotice(null);
     setIssue("");
     setOutOfScope(null);
     setPlan(null);
@@ -418,6 +422,7 @@ function SearchScreen({ onLoggedOut }: { onLoggedOut: () => void }) {
             <p className="mt-2 text-sm font-semibold text-[#1b3a6b]">{lawResult.basisLabel}</p>
           )}
           {tab === "law" && lawStatus === "done" && lawResult.notice && <p className="mt-1 text-sm text-slate-600">{lawResult.notice}</p>}
+          {tab === "case" && caseStatus === "done" && caseNotice && <p className="mt-1 text-sm text-slate-600">{caseNotice}</p>}
         </section>
       )}
 

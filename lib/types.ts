@@ -79,7 +79,12 @@ export interface SearchPlan {
   dateStatus: "none" | "clear" | "unclear";
   /** "가장 최근" 같은 조건이 있는지 */
   latestFirst: boolean;
+  /** 원하는 결과 조건: 인용 사례만(accepted), 기각 사례만(rejected), 조건 없음(null) */
+  wantedResult: WantedResult;
 }
+
+/** 사용자가 원하는 사례의 결과. accepted는 납세자 주장이 받아들여진 사례, rejected는 받아들여지지 않은 사례 */
+export type WantedResult = "accepted" | "rejected" | null;
 
 /** 법령 검색 결과 */
 export interface LawResult {
@@ -102,6 +107,8 @@ export interface SearchResponse {
   lawResult?: LawResult;
   /** 선결정례 등 범위를 검색했을 때만 들어 있다. */
   cases?: CaseItem[];
+  /** 결과 조건(인용만, 기각만)으로 걸러 냈을 때의 안내 문구. 없으면 null */
+  caseNotice?: string | null;
 }
 
 /** 본문 조회 창구가 돌려주는 내용 */
