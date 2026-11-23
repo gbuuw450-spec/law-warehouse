@@ -112,6 +112,47 @@ export async function searchDecisions(query: string, options: { bodySearch?: boo
     .filter((item) => item.id && item.caseNumber);
 }
 
+/** 저장소에 넣을 결정례 한 건 (사건명, 재결요지, 주문만. 본문은 넣지 않는다) */
+export interface DecisionIndexRow {
+  id: string;
+  caseNumber: string;
+  date: string;
+  tax: string;
+  title: string;
+  gist: string;
+  order: string;
+}
+
+/** 최근에 나온 결정례 목록을 한 쪽(100건) 받아 온다. 새 결정을 저장소에 추가할 때 쓴다. */
+export async function listLatestDecisions(page: number): Promise<{ id: string; caseNumber: string; date: string; title: string }[]> {
+  const response = await callLawApi("lawSearch.do", { target: "ttSpecialDecc", display: "100", page: String(page), sort: "ddes" });
+  return extractList(response)
+    .map((item) => ({
+      id: text(item["특별행정심판재결례일련번호"]),
+      caseNumber: text(item["청구번호"]),
+      date: normalizeDate(item["의결일자"]),
+      title: text(item["사건명"]),
+    }))
+    .filter((item) => /^\d+$/.test(item.id) && item.caseNumber);
+}
+
+/** 결정례 한 건의 사건명·재결요지·주문을 가져온다. 본문을 받을 수 없으면 null. */
+export async function getDecisionIndexRow(item: { id: string; caseNumber: string; date: string; title: string }): Promise<DecisionIndexRow | null> {
+  const outer = Object.values(await callLawApi("lawService.do", { target: "ttSpecialDecc", ID: item.id }))[0];
+  if (!outer || typeof outer !== "object" || Array.isArray(outer)) return null;
+  const detail = outer as Json;
+  const oneLine = (value: unknown) => cleanHtml(value).replace(/\s+/g, " ").trim();
+  return {
+    id: item.id,
+    caseNumber: item.caseNumber,
+    date: item.date,
+    tax: oneLine(detail["세목"]).slice(0, 40),
+    title: (oneLine(detail["사건명"]) || item.title).slice(0, 600),
+    gist: oneLine(detail["재결요지"]).slice(0, 2500),
+    order: oneLine(detail["주문"]).slice(0, 300),
+  };
+}
+
 /** 법원 판결을 검색한다. byCaseNumber가 true면 검색어를 사건번호로 보고 찾는다. */
 export async function searchPrecedents(
   query: string,

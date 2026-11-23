@@ -166,7 +166,10 @@ export async function analyzeFacts(facts: string): Promise<Analysis> {
 // 2) 사례 후보 줄 세우기
 // ─────────────────────────────────────────────────────────────
 
-const RANK_SYSTEM = `당신은 한국 조세 분야 자료 검색을 돕는 보조자다. 사실관계와, 법제처에서 조회된 사례 후보 목록(번호, 종류, 날짜, 사건명)을 받는다.
+const RANK_GIST_LIMIT = 220; // 줄 세울 때 AI에게 보여 주는 재결요지 길이 한도 (요금과 시간을 줄이기 위함)
+
+const RANK_SYSTEM = `당신은 한국 조세 분야 자료 검색을 돕는 보조자다. 사실관계와, 법제처에서 조회된 사례 후보 목록(번호, 종류, 날짜, 사건명, 있으면 요지)을 받는다.
+사건명만으로 내용을 알기 어려운 후보는 요지를 읽고 판단한다.
 사실관계와 관련 있는 후보만 골라, 관련성이 높은 순서대로 번호를 나열한다. 아래 JSON 형식으로만 답한다.
 
 {"order": [번호, 번호, ...]}
@@ -185,7 +188,9 @@ export async function rankCases(facts: string, issue: string, candidates: CaseIt
 
   const lines = candidates.map((c, index) => {
     const kind = c.kind === "decision" ? "결정례" : "판결";
-    return `${index + 1}. [${kind}] ${c.date || "날짜없음"} ${c.title}`;
+    // 재결요지가 있으면 함께 보여 준다. 사건명이 "적법한지 여부"처럼 일반적인 결정은 요지를 봐야 내용을 알 수 있다.
+    const gist = c.gist ? ` / 요지: ${c.gist.slice(0, RANK_GIST_LIMIT)}` : "";
+    return `${index + 1}. [${kind}] ${c.date || "날짜없음"} ${c.title}${gist}`;
   });
   const condition = latestFirst ? "\n<조건>사용자는 가장 최근 사례를 원한다. 관련 있는 사례 중 날짜가 최근인 것을 빠뜨리지 않는다.</조건>" : "";
   const answer = await askJson(RANK_SYSTEM, `<사실관계>\n${facts}\n</사실관계>\n<쟁점>${issue}</쟁점>${condition}\n<후보>\n${lines.join("\n")}\n</후보>`);

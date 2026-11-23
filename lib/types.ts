@@ -34,6 +34,8 @@ export interface CaseItem {
   source: string;
   /** 목록에서 이미 알 수 있는 결과 (없으면 빈 글자) */
   resultFromList: string;
+  /** 재결요지. 저장소에서 찾은 결정례에만 들어 있다. (AI가 줄 세울 때 읽는다) */
+  gist?: string;
 }
 
 /** 사례 한 건의 요약 결과 */

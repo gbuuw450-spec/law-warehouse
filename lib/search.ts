@@ -8,6 +8,7 @@
 
 import { analyzeFacts, rankCases } from "./ai";
 import { findCaseNumbers, isOnlyCaseNumbers, normalizeCaseNumber } from "./case-number";
+import { isStoreReady, searchStoredDecisions, StoreError } from "./decision-store";
 import { keepLatestOfSameDecisions } from "./dedupe";
 import { describeWantedResult, matchesWantedResult, outcomeFromDecisionOrder, outcomeFromVerdictType } from "./result-filter";
 import { getArticle, getCaseBody, searchDecisions, searchPrecedents, LawApiError, type LawCache } from "./law-api";
@@ -109,6 +110,24 @@ async function findByCaseNumbers(numbers: string[], kind: CaseKind): Promise<Cas
 /** 여러 검색어로 사례 후보를 모은 뒤, AI가 관련성 순으로 줄 세운다. */
 async function findCases(facts: string, plan: SearchPlan, kind: CaseKind, wantedResult: WantedResult): Promise<CaseItem[]> {
   if (plan.keywords.length === 0) return [];
+
+  // 선결정례는 먼저 저장소에서 찾는다. 저장소는 사건명뿐 아니라 재결요지에서도 낱말을 찾으므로,
+  // 사건명이 일반적인 결정도 찾을 수 있다. 저장소를 쓸 수 없거나 아무것도 못 찾으면 아래의 법제처 검색으로 넘어간다.
+  if (kind === "decision" && isStoreReady()) {
+    try {
+      const stored = await searchStoredDecisions(plan.keywords, wantedResult, MAX_COLLECTED);
+      if (stored.length > 0) {
+        const candidates = keepLatestOfSameDecisions(stored).slice(0, MAX_CANDIDATES);
+        const order = await rankCases(facts, plan.issue, candidates, plan.latestFirst);
+        const ranked = order.map((index) => candidates[index]).slice(0, MAX_CASES);
+        if (plan.latestFirst) ranked.sort((a, b) => b.date.localeCompare(a.date));
+        return ranked;
+      }
+    } catch (error) {
+      if (!(error instanceof StoreError)) throw error; // AI 오류 등은 그대로 알린다.
+      console.error("[저장소 검색 실패] 법제처 검색으로 넘어갑니다.");
+    }
+  }
 
   // 고른 토글의 종류(조세심판원 결정례 또는 법원 판결)만 검색어마다 조회한다. 앞쪽 검색어 3개는 본문 검색도 함께 한다.
   // 후보는 항상 최근 날짜 순으로 받아, 최근 사례가 후보에서 빠지지 않게 한다.
