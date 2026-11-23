@@ -60,6 +60,25 @@ async function post<T>(path: string, body: unknown, limitMs: number): Promise<T>
   return data as T;
 }
 
+// 브라우저의 음성 인식 기능 중 이 화면이 쓰는 부분만 적어 둔 모양
+interface Recognition {
+  lang: string;
+  continuous: boolean;
+  interimResults: boolean;
+  start(): void;
+  stop(): void;
+  onresult: ((event: { resultIndex: number; results: ArrayLike<ArrayLike<{ transcript: string }> & { isFinal: boolean }> }) => void) | null;
+  onerror: ((event: { error: string }) => void) | null;
+  onend: (() => void) | null;
+}
+
+/** 이 브라우저의 음성 인식 기능을 찾는다. 지원하지 않으면 null. (크롬·엣지·사파리는 지원, 파이어폭스는 미지원) */
+function getRecognitionClass(): (new () => Recognition) | null {
+  if (typeof window === "undefined") return null;
+  const browser = window as unknown as { SpeechRecognition?: new () => Recognition; webkitSpeechRecognition?: new () => Recognition };
+  return browser.SpeechRecognition ?? browser.webkitSpeechRecognition ?? null;
+}
+
 /** 지금 시각(밀리초). 검색에 걸린 시간을 잴 때 쓴다. */
 const now = () => Date.now();
 
@@ -230,6 +249,71 @@ function SearchScreen({ onLoggedOut }: { onLoggedOut: () => void }) {
 
   const [openItems, setOpenItems] = useState<Record<string, boolean>>({});
   const [details, setDetails] = useState<Record<string, DetailState>>({});
+
+  // 음성 입력: 마이크 버튼을 누르고 말하면 그 내용이 검색창에 글로 들어간다. (브라우저의 음성 인식 기능을 쓴다)
+  const [listening, setListening] = useState(false);
+  const [voiceMessage, setVoiceMessage] = useState("");
+  const recognitionRef = useRef<Recognition | null>(null);
+  const factsBox = useRef<HTMLTextAreaElement>(null);
+
+  // 음성으로 글이 들어와도 검색창 높이가 내용에 맞게 늘어나게 한다.
+  useEffect(() => {
+    const box = factsBox.current;
+    if (!box) return;
+    box.style.height = "auto";
+    box.style.height = `${box.scrollHeight}px`;
+  }, [facts]);
+
+  /** 마이크 버튼: 누르면 듣기 시작하고, 다시 누르면 멈춘다. */
+  function toggleVoice() {
+    if (listening) {
+      recognitionRef.current?.stop();
+      return;
+    }
+    const RecognitionClass = getRecognitionClass();
+    if (!RecognitionClass) {
+      setVoiceMessage("이 브라우저는 음성 입력을 지원하지 않습니다. 크롬이나 엣지에서 사용해 주세요.");
+      return;
+    }
+
+    const recognition = new RecognitionClass();
+    recognition.lang = "ko-KR";
+    recognition.continuous = true; // 다시 누를 때까지 계속 듣는다.
+    recognition.interimResults = false; // 문장이 확정된 뒤에만 검색창에 넣는다.
+    recognition.onresult = (event) => {
+      let spoken = "";
+      for (let index = event.resultIndex; index < event.results.length; index += 1) {
+        if (event.results[index].isFinal) spoken += event.results[index][0].transcript;
+      }
+      spoken = spoken.trim();
+      if (!spoken) return;
+      // 이미 적어 둔 글 뒤에 이어 붙인다.
+      setFacts((previous) => (previous.trim() ? `${previous.replace(/\s+$/, "")} ${spoken}` : spoken));
+      setWarning("");
+    };
+    recognition.onerror = (event) => {
+      if (event.error === "not-allowed" || event.error === "service-not-allowed") {
+        setVoiceMessage("마이크 사용이 허용되지 않았습니다. 브라우저 주소창의 마이크 권한을 허용해 주세요.");
+      } else if (event.error === "audio-capture") {
+        setVoiceMessage("마이크를 찾지 못했습니다. 마이크가 연결되어 있는지 확인해 주세요.");
+      } else if (event.error !== "no-speech" && event.error !== "aborted") {
+        setVoiceMessage("음성을 인식하지 못했습니다. 마이크 버튼을 다시 눌러 주세요.");
+      }
+    };
+    recognition.onend = () => {
+      setListening(false);
+      recognitionRef.current = null;
+    };
+
+    setVoiceMessage("");
+    try {
+      recognition.start();
+      recognitionRef.current = recognition;
+      setListening(true);
+    } catch {
+      setVoiceMessage("음성 입력을 시작하지 못했습니다. 마이크 버튼을 다시 눌러 주세요.");
+    }
+  }
 
   const lastFacts = useRef("");
   // 토글마다 검색을 새로 시작하면 번호가 올라간다. 이전 검색의 답이 늦게 도착해도 화면에 섞이지 않게 한다.
@@ -422,6 +506,7 @@ function SearchScreen({ onLoggedOut }: { onLoggedOut: () => void }) {
       <form
         onSubmit={(event) => {
           event.preventDefault();
+          recognitionRef.current?.stop(); // 검색을 누르면 음성 입력은 멈춘다.
           search(facts);
         }}
         className="rounded-lg border border-slate-200 bg-white p-3 shadow-sm"
@@ -430,6 +515,7 @@ function SearchScreen({ onLoggedOut }: { onLoggedOut: () => void }) {
           사실관계
         </label>
         <textarea
+          ref={factsBox}
           id="facts"
           value={facts}
           onChange={(event) => {
@@ -471,6 +557,17 @@ function SearchScreen({ onLoggedOut }: { onLoggedOut: () => void }) {
 
         <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
           <p className="text-xs text-slate-500">의뢰인을 알아볼 수 있는 정보는 적지 마세요.</p>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={toggleVoice}
+              aria-pressed={listening}
+              className={`rounded border px-4 py-2 font-semibold ${
+                listening ? "border-red-600 bg-red-600 text-white" : "border-[#1b3a6b] bg-white text-[#1b3a6b]"
+              }`}
+            >
+              {listening ? "■ 듣는 중 (멈춤)" : "🎤 음성 입력"}
+            </button>
           <button
             type="submit"
             disabled={!facts.trim() || currentStatus === "loading"}
@@ -478,7 +575,14 @@ function SearchScreen({ onLoggedOut }: { onLoggedOut: () => void }) {
           >
             {currentStatus === "loading" ? "찾는 중…" : `${TAB_LABEL[tab]} 검색`}
           </button>
+          </div>
         </div>
+        {listening && <p className="mt-2 text-sm text-red-700">말씀하세요. 말한 내용이 검색창에 들어갑니다. 끝나면 버튼을 다시 누르세요.</p>}
+        {voiceMessage && (
+          <p role="alert" className="mt-2 text-sm text-slate-700">
+            {voiceMessage}
+          </p>
+        )}
         {warning && (
           <p role="alert" className="mt-2 rounded border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900">
             {warning}
