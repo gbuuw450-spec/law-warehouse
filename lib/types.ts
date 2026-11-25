@@ -36,6 +36,8 @@ export interface CaseItem {
   resultFromList: string;
   /** 재결요지. 저장소에서 찾은 결정례에만 들어 있다. (AI가 줄 세울 때 읽는다) */
   gist?: string;
+  /** 본문에서 사용자의 핵심 표현이 나오는 대목. 본문 확인을 한 결정례에만 들어 있다. (AI가 줄 세울 때 읽는다) */
+  bodySnippet?: string;
 }
 
 /** 사례 한 건의 요약 결과 */
@@ -81,6 +83,8 @@ export interface SearchPlan {
   dateStatus: "none" | "clear" | "unclear";
   /** "가장 최근" 같은 조건이 있는지 */
   latestFirst: boolean;
+  /** 이 사례를 다른 사례와 구별해 주는 핵심 표현 (날짜, 조문 번호, 고유한 용어). 후보의 본문에서 찾아본다. */
+  bodyTerms: string[];
 }
 
 /** 선결정례 토글에서 사용자가 고른 결과 조건. accepted는 인용, rejected는 기각, null은 선택 안 함(결과와 상관없이 찾기) */

@@ -106,6 +106,8 @@ export interface Analysis {
   dateStatus: "none" | "clear" | "unclear";
   /** "가장 최근" 같은 조건이 있는지 */
   latestFirst: boolean;
+  /** 이 사례를 다른 사례와 구별해 주는 핵심 표현. 후보의 본문에서 찾아본다. */
+  bodyTerms: string[];
 }
 
 const ANALYZE_SYSTEM = `당신은 한국 조세 분야 자료 검색을 돕는 보조자다. 사용자가 적은 사실관계(또는 찾고 싶은 사례 설명)를 읽고 아래 JSON 형식으로만 답한다.
@@ -118,14 +120,17 @@ const ANALYZE_SYSTEM = `당신은 한국 조세 분야 자료 검색을 돕는 �
   "lawCandidates": 관련 가능성이 높은 순서로 최대 12개 [{"lawName": 법령의 정식 명칭, "articleNo": 조 번호(정수), "branchNo": 가지번호(없으면 0), "title": 조문 제목(괄호 안에 적힌 제목 그대로, 예: "불복"), "reason": 이 조문이 사례와 관련된 이유 1문장}],
   "dateStatus": "none" | "clear" | "unclear",
   "baseDate": "YYYYMMDD" 또는 null,
-  "latestFirst": true 또는 false
+  "latestFirst": true 또는 false,
+  "bodyTerms": 결정문 본문에서 그대로 찾아볼 핵심 표현 3~6개
 }
 
 규칙:
 - keywords: 각 검색어는 1~2개 단어로 짧게 쓴다. 띄어 쓴 단어는 모두 포함된 사건명만 검색되므로, 긴 문장은 쓰지 않는다. 같은 뜻의 다른 표현(예: "가공거래", "가공매입", "가공세금계산서")을 섞어 넣는다. 가장 중요한 검색어를 앞에 둔다.
 - lawCandidates: 법률, 시행령, 시행규칙을 가리지 않고 실제 존재한다고 확신하는 조문만 넣는다. 확신이 없으면 넣지 않는다. 이 목록은 법제처에서 조회해 확인한 뒤에만 사용된다. "제47조의2"는 articleNo 47, branchNo 2로 쓴다. 법 개정으로 조문 번호가 바뀌었을 수 있으므로 title은 반드시 채운다. 번호와 제목이 다르면 제목으로 다시 찾는다. 쟁점에 직접 적용되는 조문뿐 아니라, 그 조문을 준용하거나 절차(청구기간, 각하·기각·인용 결정, 준용 규정)를 정한 조문도 관련이 있으면 넣는다.
 - dateStatus와 baseDate: 거래·처분·과세 시점이 글에 하나로 명확히 적혀 있을 때만 "clear"로 하고 baseDate를 채운다. 월까지만 있으면 그 달 말일, 연도만 있으면 그 해 12월 31일로 한다. 시점이 전혀 없으면 "none", "작년"처럼 모호하거나 서로 다른 연도가 여러 개면 "unclear"로 하고 baseDate는 null로 한다. 추정하지 않는다.
-- latestFirst: "가장 최근", "최신" 처럼 최근 사례를 원한다는 조건이 있을 때만 true.- 사건번호, 판결 내용, 결론은 절대 쓰지 않는다.`;
+- latestFirst: "가장 최근", "최신" 처럼 최근 사례를 원한다는 조건이 있을 때만 true.
+- bodyTerms: 이 사례를 비슷한 다른 사례와 구별해 주는 표현을 사용자 글에서 고른다. 결정문 본문에 그 글자 그대로 적혀 있을 법한 것만 넣는다. 예: 고유한 용어("기존임대주택"), 날짜("2005.1.5" 형식), 조문("제3조 제1항 제3호" 형식, 법령 이름은 빼고 조·항·호만), 고유한 거래 형태("콜옵션"). "과세", "처분", "여부"처럼 어느 결정문에나 나오는 말과 keywords에 넣은 넓은 말("합산배제", "임대주택")은 넣지 않는다. 사용자 글에 없는 내용을 지어내지 않는다. 구별되는 표현이 없으면 빈 배열로 둔다.
+- 사건번호, 판결 내용, 결론은 절대 쓰지 않는다.`;
 
 /** 사실관계에서 쟁점, 검색어, 법령 후보, 시점을 뽑는다. */
 export async function analyzeFacts(facts: string): Promise<Analysis> {
@@ -159,17 +164,24 @@ export async function analyzeFacts(facts: string): Promise<Analysis> {
     lawCandidates,
     baseDate: dateStatus === "clear" ? rawDate : null,
     dateStatus,
-    latestFirst: answer.latestFirst === true,  };
+    latestFirst: answer.latestFirst === true,
+    bodyTerms: (Array.isArray(answer.bodyTerms) ? answer.bodyTerms : [])
+      .map(asString)
+      .filter((term) => term.length >= 2 && term.length <= 30)
+      .slice(0, 6),
+  };
 }
 
 // ─────────────────────────────────────────────────────────────
 // 2) 사례 후보 줄 세우기
 // ─────────────────────────────────────────────────────────────
 
+const RANK_SNIPPET_LIMIT = 220; // 줄 세울 때 AI에게 보여 주는 본문 대목 길이 한도
 const RANK_GIST_LIMIT = 220; // 줄 세울 때 AI에게 보여 주는 재결요지 길이 한도 (요금과 시간을 줄이기 위함)
 
 const RANK_SYSTEM = `당신은 한국 조세 분야 자료 검색을 돕는 보조자다. 사실관계와, 법제처에서 조회된 사례 후보 목록(번호, 종류, 날짜, 사건명, 있으면 요지)을 받는다.
 사건명만으로 내용을 알기 어려운 후보는 요지를 읽고 판단한다.
+일부 후보에는 "본문 중"이 붙어 있다. 이것은 사용자가 적은 핵심 표현이 그 결정의 본문에 실제로 나오는 대목이다. 사건명이나 요지가 다른 쟁점처럼 보여도, 이 대목이 사실관계와 맞으면 관련성이 높은 것으로 본다. 다만 표현만 스쳐 지나갈 뿐 내용이 다르면 관련성을 높이지 않는다.
 사실관계와 관련 있는 후보만 골라, 관련성이 높은 순서대로 번호를 나열한다. 아래 JSON 형식으로만 답한다.
 
 {"order": [번호, 번호, ...]}
@@ -190,7 +202,9 @@ export async function rankCases(facts: string, issue: string, candidates: CaseIt
     const kind = c.kind === "decision" ? "결정례" : "판결";
     // 재결요지가 있으면 함께 보여 준다. 사건명이 "적법한지 여부"처럼 일반적인 결정은 요지를 봐야 내용을 알 수 있다.
     const gist = c.gist ? ` / 요지: ${c.gist.slice(0, RANK_GIST_LIMIT)}` : "";
-    return `${index + 1}. [${kind}] ${c.date || "날짜없음"} ${c.title}${gist}`;
+    // 본문에서 사용자의 핵심 표현이 나오는 대목이 있으면 함께 보여 준다. (사건명과 요지에 없는 내용을 보기 위함)
+    const snippet = c.bodySnippet ? ` / 본문 중: ${c.bodySnippet.slice(0, RANK_SNIPPET_LIMIT)}` : "";
+    return `${index + 1}. [${kind}] ${c.date || "날짜없음"} ${c.title}${gist}${snippet}`;
   });
   const condition = latestFirst ? "\n<조건>사용자는 가장 최근 사례를 원한다. 관련 있는 사례 중 날짜가 최근인 것을 빠뜨리지 않는다.</조건>" : "";
   const answer = await askJson(RANK_SYSTEM, `<사실관계>\n${facts}\n</사실관계>\n<쟁점>${issue}</쟁점>${condition}\n<후보>\n${lines.join("\n")}\n</후보>`);

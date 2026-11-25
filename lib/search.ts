@@ -7,6 +7,7 @@
 // 사례 요약은 여기서 만들지 않는다. 화면이 5건씩 따로 요청한다. (lib/summarize.ts)
 
 import { analyzeFacts, rankCases } from "./ai";
+import { matchBody } from "./body-match";
 import { findCaseNumbers, isOnlyCaseNumbers, normalizeCaseNumber } from "./case-number";
 import { isStoreReady, searchStoredDecisions, StoreError } from "./decision-store";
 import { keepLatestOfSameDecisions } from "./dedupe";
@@ -20,9 +21,10 @@ const MAX_CANDIDATES = 110; // AI에게 보여 줄 사례 후보 수 한도
 const MAX_COLLECTED = 170; // 같은 결정을 묶기 전에 모아 둘 후보 수 한도
 const RESULT_CHECK_AT_ONCE = 12; // 결과(주문)를 확인할 때 동시에 조회하는 건수
 const RESULT_CHECK_LIMIT_MS = 15_000; // 결과 확인에 쓰는 시간 한도
+const BODY_CHECK_LIMIT_MS = 10_000; // 본문 확인(핵심 표현 찾기)에 쓰는 시간 한도
 
 // 사건번호만 적었을 때 돌려주는 빈 검색 계획. (AI 분석을 하지 않았다는 뜻)
-const NUMBER_ONLY_PLAN: SearchPlan = { isTax: true, issue: "", keywords: [], lawCandidates: [], baseDate: null, dateStatus: "none", latestFirst: false };
+const NUMBER_ONLY_PLAN: SearchPlan = { isTax: true, issue: "", keywords: [], lawCandidates: [], baseDate: null, dateStatus: "none", latestFirst: false, bodyTerms: [] };
 
 const formatDate =(yyyymmdd: string) => `${yyyymmdd.slice(0, 4)}.${yyyymmdd.slice(4, 6)}.${yyyymmdd.slice(6, 8)}.`;
 
@@ -84,6 +86,45 @@ async function keepWantedResult(items: CaseItem[], wanted: WantedResult): Promis
 }
 
 /**
+ * 본문 확인: 후보마다 본문을 법제처에서 가져와, 사용자의 핵심 표현이 나오는 대목을 붙인다.
+ * 사건명과 재결요지에는 없고 본문(청구인 주장 등)에만 있는 내용을 AI가 볼 수 있게 하려는 것이다.
+ * AI를 쓰지 않으므로 요금은 들지 않는다. 핵심 표현이 많이 나온 후보를 앞에 두고, 나머지는 원래 순서를 지킨다.
+ * 정해진 시간 안에 확인하지 못한 후보는 대목 없이 그대로 둔다. (본문 확인이 실패해도 검색은 계속한다)
+ */
+async function addBodySnippets(items: CaseItem[], terms: string[]): Promise<CaseItem[]> {
+  if (terms.length === 0 || items.length === 0) return items;
+
+  const deadline = Date.now() + BODY_CHECK_LIMIT_MS;
+  const matchedCount = new Array<number>(items.length).fill(0);
+  const result = [...items];
+  let next = 0;
+
+  async function worker() {
+    while (next < items.length && Date.now() < deadline) {
+      const index = next;
+      next += 1;
+      try {
+        const body = await getCaseBody(items[index].kind, items[index].id);
+        if (!body) continue;
+        const match = matchBody(body.fullText, terms);
+        if (match.matched.length === 0) continue;
+        matchedCount[index] = match.matched.length;
+        result[index] = { ...items[index], bodySnippet: match.snippet };
+      } catch {
+        // 한 건을 조회하지 못해도 나머지는 계속한다.
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: RESULT_CHECK_AT_ONCE }, worker));
+
+  // 찾은 핵심 표현의 가짓수가 많은 후보를 앞에 둔다. 가짓수가 같으면 원래 순서(저장소 점수 순)를 지킨다.
+  return result
+    .map((item, index) => ({ item, index }))
+    .sort((a, b) => matchedCount[b.index] - matchedCount[a.index] || a.index - b.index)
+    .map((entry) => entry.item);
+}
+
+/**
  * 사건번호로 사례를 바로 찾는다. AI를 쓰지 않는다.
  * 법제처가 돌려준 것 중 사건번호가 실제로 맞는 것만 남긴다. (비슷한 번호가 섞여 나오는 것을 막는다)
  */
@@ -117,7 +158,9 @@ async function findCases(facts: string, plan: SearchPlan, kind: CaseKind, wanted
     try {
       const stored = await searchStoredDecisions(plan.keywords, wantedResult, MAX_COLLECTED);
       if (stored.length > 0) {
-        const candidates = keepLatestOfSameDecisions(stored).slice(0, MAX_CANDIDATES);
+        // 후보의 본문을 열어 사용자의 핵심 표현이 나오는 대목을 찾고, 그런 후보를 앞에 둔 뒤 AI에게 보여 줄 만큼만 추린다.
+        const checked = await addBodySnippets(keepLatestOfSameDecisions(stored), plan.bodyTerms);
+        const candidates = checked.slice(0, MAX_CANDIDATES);
         const order = await rankCases(facts, plan.issue, candidates, plan.latestFirst);
         const ranked = order.map((index) => candidates[index]).slice(0, MAX_CASES);
         if (plan.latestFirst) ranked.sort((a, b) => b.date.localeCompare(a.date));
@@ -239,7 +282,12 @@ export function sanitizePlan(raw: unknown): SearchPlan | null {
     lawCandidates,
     baseDate: dateStatus === "clear" ? baseDate : null,
     dateStatus,
-    latestFirst: plan.latestFirst === true,  };
+    latestFirst: plan.latestFirst === true,
+    bodyTerms: (Array.isArray(plan.bodyTerms) ? plan.bodyTerms : [])
+      .map((term) => asText(term, 30))
+      .filter((term) => term.length >= 2)
+      .slice(0, 6),
+  };
 }
 
 /**
